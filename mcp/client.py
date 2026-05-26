@@ -1,9 +1,11 @@
 """
-LinkedIn REST API v2 client.
+LinkedIn REST API v2 client + Voyager (internal web) client.
 
-All public methods return plain Python dicts/lists. They raise
-httpx.HTTPStatusError on 4xx/5xx responses (the caller decides how to
-surface that to the MCP tool user).
+LinkedInClient  — official OAuth API (api.linkedin.com/v2)
+VoyagerClient   — LinkedIn's internal web API (linkedin.com/voyager/api),
+                  authenticated via browser session cookies (li_at + JSESSIONID).
+                  Requires no partner-program access; use set_web_session tool
+                  to register cookies extracted once from your browser DevTools.
 
 LinkedIn API surface used here:
   GET  /v2/userinfo                          (OpenID Connect – profile + email)
@@ -11,22 +13,22 @@ LinkedIn API surface used here:
   POST /v2/ugcPosts                          (create a post)
   GET  /v2/ugcPosts?q=authors&...            (list own posts)
   DELETE /v2/ugcPosts/{urn}                  (delete a post)
-
-Fields that require LinkedIn Partner-Program access (experience, education,
-certifications, skills via the Profile API) are NOT available through the
-standard Consumer API. Those tools will return clear explanations rather than
-failing silently.
+  GET  voyager/api/me                        (full profile via web session)
+  PATCH voyager/api/identity/profiles/{id}  (update headline via web session)
 """
 
 from __future__ import annotations
 
+import json
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import httpx
 
 API_BASE = "https://api.linkedin.com/v2"
 OPENID_USERINFO = "https://api.linkedin.com/v2/userinfo"
+VOYAGER_BASE = "https://www.linkedin.com/voyager/api"
 
 # LinkedIn requires this header on all v2 REST calls.
 RESTLI_HEADER = {"X-Restli-Protocol-Version": "2.0.0"}
@@ -231,3 +233,317 @@ class LinkedInClient:
                     ),
                 }
             raise
+
+
+# ── Voyager (web session) client ───────────────────────────────────────────────
+
+_VOYAGER_FETCH_SCRIPT = """
+    async ({url, jsessionid, method, body}) => {
+        const opts = {
+            method,
+            headers: {
+                'accept': 'application/vnd.linkedin.normalized+json+2.1',
+                'x-restli-protocol-version': '2.0.0',
+                'x-li-lang': 'en_US',
+                'csrf-token': jsessionid,
+            }
+        };
+        if (body) {
+            opts.body = JSON.stringify(body);
+            opts.headers['content-type'] = 'application/json';
+        }
+        const resp = await fetch(url, opts);
+        return { status: resp.status, body: await resp.text() };
+    }
+"""
+
+_PAGE_TEXT_SCRIPT = """
+    () => {
+        const main = document.querySelector('main') || document.querySelector('[role="main"]');
+        return (main || document.body).innerText;
+    }
+"""
+
+
+class VoyagerClient:
+    """
+    LinkedIn Voyager API client backed by a Playwright persistent browser context.
+
+    LinkedIn's Cloudflare protection ties session cookies to the browser
+    fingerprint that created them.  Plain HTTP clients (httpx, curl) and fresh
+    Playwright contexts are rejected via TLS fingerprinting even with valid
+    cookies.  The only reliable path is to reuse the exact same persistent
+    Chromium profile that was used during the authenticate() OAuth flow.
+
+    Flow per request:
+      1. Re-open the persistent context at *user_data_dir* (same fingerprint).
+      2. Navigate to linkedin.com/feed/ (required so fetch() runs on that origin).
+      3. Execute the Voyager fetch() call from within the browser's JS engine.
+      4. Parse and return the JSON response.
+    """
+
+    def __init__(
+        self,
+        li_at: str,
+        jsessionid: str,
+        user_data_dir: Optional[str] = None,
+        timeout: float = 30.0,
+    ) -> None:
+        self._li_at = li_at
+        self._jsessionid = jsessionid.strip('"')
+        self._user_data_dir = user_data_dir
+        self._timeout_ms = int(timeout * 1000)
+
+    def _request(self, path: str, method: str = "GET", body: Optional[dict] = None) -> Any:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(self._browser_request, path, method, body).result()
+
+    def _browser_request(self, path: str, method: str, body: Optional[dict]) -> Any:
+        from playwright.sync_api import sync_playwright
+
+        if not self._user_data_dir:
+            raise RuntimeError(
+                "No persistent browser profile found. "
+                "Run the `authenticate` tool once to set up the browser session "
+                "needed for Voyager API access."
+            )
+
+        url = f"{VOYAGER_BASE}{path}"
+        jsessionid = self._jsessionid
+
+        _BLOCKED = {"image", "media", "font", "stylesheet", "other"}
+
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                self._user_data_dir,
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                page = context.new_page()
+                page.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in _BLOCKED
+                    else route.continue_(),
+                )
+                page.goto(
+                    "https://www.linkedin.com/feed/",
+                    wait_until="domcontentloaded",
+                    timeout=self._timeout_ms,
+                )
+                live_cookies = context.cookies("https://www.linkedin.com")
+                live_jsessionid = next(
+                    (c["value"].strip('"') for c in live_cookies if c["name"] == "JSESSIONID"),
+                    jsessionid,
+                )
+                result = page.evaluate(
+                    _VOYAGER_FETCH_SCRIPT,
+                    {"url": url, "jsessionid": live_jsessionid, "method": method, "body": body},
+                )
+            finally:
+                context.close()
+
+        if result["status"] >= 400:
+            raise RuntimeError(
+                f"Voyager API error {result['status']}: {result['body'][:300]}"
+            )
+        return json.loads(result["body"]) if result["body"] else {}
+
+    def _get(self, path: str, params: Optional[dict] = None) -> Any:
+        if params:
+            path = f"{path}?{urllib.parse.urlencode(params)}"
+        return self._request(path, "GET")
+
+    def _patch(self, path: str, body: dict) -> Any:
+        return self._request(path, "PATCH", body)
+
+    def get_me(self) -> dict:
+        """
+        Fetch the authenticated member's profile from the Voyager API.
+
+        Returns a normalized dict with keys: headline, first_name, last_name,
+        public_id, entity_urn, picture_url.
+        """
+        raw = self._get("/me")
+
+        # Voyager /me: miniProfile lives in included[0], data holds only a URN pointer.
+        included = raw.get("included", [])
+        mini = included[0] if included else {}
+
+        if not mini:
+            mini = raw.get("data", raw)
+            if "miniProfile" in mini:
+                mini = mini["miniProfile"]
+
+        picture_root = mini.get("picture", {})
+        artifacts = (
+            picture_root
+            .get("com.linkedin.common.VectorImage", {})
+            .get("artifacts", [])
+        )
+        picture_url = ""
+        if artifacts:
+            root_url = (
+                picture_root
+                .get("com.linkedin.common.VectorImage", {})
+                .get("rootUrl", "")
+            )
+            picture_url = root_url + artifacts[-1].get("fileIdentifyingUrlPathSegment", "")
+
+        return {
+            "headline": mini.get("occupation", ""),
+            "first_name": mini.get("firstName", ""),
+            "last_name": mini.get("lastName", ""),
+            "public_id": mini.get("publicIdentifier", ""),
+            "entity_urn": mini.get("entityUrn", ""),
+            "picture_url": picture_url,
+        }
+
+    def update_headline(self, headline: str, public_id: str) -> dict:
+        """Update the profile headline via Voyager."""
+        return self._patch(
+            f"/identity/profiles/{public_id}",
+            {"patch": {"$set": {"headline": headline}}},
+        )
+
+    def get_notifications(self, count: int = 20) -> list[dict]:
+        """
+        Fetch recent notifications by scraping the LinkedIn notifications page DOM.
+
+        LinkedIn renders notification cards server-side; the Voyager REST endpoint
+        returns only badge counts, not the cards themselves.
+        """
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(self._browser_scrape_notifications, count).result()
+
+    def _browser_scrape_notifications(self, count: int) -> list[dict]:
+        from playwright.sync_api import sync_playwright
+
+        if not self._user_data_dir:
+            raise RuntimeError(
+                "No persistent browser profile found. Run authenticate first."
+            )
+
+        _BLOCKED = {"image", "media", "font", "stylesheet", "other"}
+        _EXTRACT_SCRIPT = """
+            () => {
+                const cards = document.querySelectorAll(
+                    '.nt-card-list__item, [data-urn], .notification-item, article'
+                );
+                if (cards.length) {
+                    return Array.from(cards).map(c => c.innerText.trim()).filter(Boolean);
+                }
+                const main = document.querySelector('main') || document.body;
+                return main.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
+            }
+        """
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                self._user_data_dir,
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                page = context.new_page()
+                page.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in _BLOCKED
+                    else route.continue_(),
+                )
+                page.goto(
+                    "https://www.linkedin.com/notifications/",
+                    wait_until="domcontentloaded",
+                    timeout=self._timeout_ms,
+                )
+                page.evaluate("window.scrollTo(0, 600)")
+                page.wait_for_timeout(2000)
+                items = page.evaluate(_EXTRACT_SCRIPT)
+            finally:
+                context.close()
+
+        return [{"text": t} for t in items[:count]]
+
+    def get_conversations(self, entity_urn: str, count: int = 20) -> list[dict]:
+        """
+        Fetch recent messaging conversations via Voyager GraphQL.
+
+        entity_urn: the URN from get_me() — either fs_miniProfile or fsd_profile form;
+        the raw member ID is extracted and rebuilt as fsd_profile for the mailbox query.
+        """
+        raw_id = entity_urn.split(":")[-1]
+        mailbox_urn = f"urn:li:fsd_profile:{raw_id}"
+        encoded = urllib.parse.quote(mailbox_urn, safe="")
+        path = (
+            f"/voyagerMessagingGraphQL/graphql"
+            f"?queryId=messengerConversations.0d5e6781bbee71c3e51c8843c6519f48"
+            f"&variables=(mailboxUrn:{encoded})"
+        )
+        raw = self._get(path)
+        included = raw.get("included", [])
+        convos = [
+            item for item in included
+            if item.get("$type") == "com.linkedin.messenger.Conversation"
+        ]
+        return convos[:count]
+
+    def get_profile_sections(self, public_id: str) -> dict:
+        """
+        Scrape profile sections (about, experience, education, skills) via browser.
+
+        Navigates to each detail page within a single persistent browser context
+        and extracts the main content text.
+        """
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(self._browser_scrape_profile, public_id).result()
+
+    def _browser_scrape_profile(self, public_id: str) -> dict:
+        from playwright.sync_api import sync_playwright
+
+        if not self._user_data_dir:
+            raise RuntimeError(
+                "No persistent browser profile found. "
+                "Run the `authenticate` tool once to set up the browser session."
+            )
+
+        _BLOCKED = {"image", "media", "font", "stylesheet", "other"}
+        pages = {
+            "about": f"/in/{public_id}/",
+            "experience": f"/in/{public_id}/details/experience/",
+            "education": f"/in/{public_id}/details/education/",
+            "skills": f"/in/{public_id}/details/skills/",
+        }
+        sections: dict = {}
+
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                self._user_data_dir,
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                page = context.new_page()
+                page.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in _BLOCKED
+                    else route.continue_(),
+                )
+                for section, path in pages.items():
+                    try:
+                        page.goto(
+                            f"https://www.linkedin.com{path}",
+                            wait_until="domcontentloaded",
+                            timeout=self._timeout_ms,
+                        )
+                        page.evaluate("window.scrollTo(0, 600)")
+                        page.wait_for_timeout(1500)
+                        content = page.evaluate(_PAGE_TEXT_SCRIPT)
+                        sections[section] = content[:4000]
+                    except Exception as exc:
+                        sections[section] = f"Error: {exc}"
+            finally:
+                context.close()
+
+        return sections

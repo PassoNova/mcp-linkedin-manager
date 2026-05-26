@@ -2,31 +2,39 @@
 LinkedIn MCP Server
 ===================
 A Model Context Protocol server that lets Claude manage your LinkedIn
-presence through the official LinkedIn REST API v2.
+presence through the official LinkedIn REST API v2 and the Voyager internal
+API (via a persistent Playwright browser session).
 
 Tools exposed
 ─────────────
-  authenticate          – OAuth 2.0 browser flow; saves token to disk
+  authenticate          – OAuth 2.0 browser flow; saves token + browser session
   logout                – Delete the saved token
   check_auth            – Show token status and available scopes
   get_profile           – Name, headline, profile URL, email
+  get_full_profile      – Full profile: about, experience, education, skills
   update_headline       – Change your profile headline
   create_post           – Publish a new text post
   get_posts             – List your recent posts
   delete_post           – Remove a post by URN
-  get_api_capabilities  – Explain what the standard API can/cannot do
+  get_notifications     – Fetch your recent LinkedIn notifications
+  get_conversations     – Fetch your recent direct message conversations
+  get_api_capabilities  – Explain what each API tier can/cannot do
   get_community_stats   – Connection count (partner scope; graceful fallback)
 
 LinkedIn API limitations
 ────────────────────────
-The standard Consumer API (no partner-program approval required) supports:
+Standard Consumer API (no partner approval):
   ✅  Read basic profile (name, headline, photo, email)
   ✅  Create, read, and delete UGC posts
-  ⚠️  Update headline (requires rw_me scope — may be rejected by LinkedIn)
-  ❌  Read/write experience, education, certifications, skills
-      → These require the restricted Profile API (LinkedIn partner program)
-  ❌  Read connections list or send connection requests
-      → Requires r_network / w_connections (partner-gated)
+  ⚠️  Update headline (requires rw_me scope — may be rejected)
+  ❌  Read experience, education, skills, connections
+
+Voyager / Playwright browser session (enabled after authenticate):
+  ✅  Full profile headline
+  ✅  Profile sections: about, experience, education, skills (via DOM)
+  ✅  Notifications
+  ✅  Direct message conversations
+  ❌  Send messages / connection requests (read-only via Voyager)
 
 Usage
 ─────
@@ -49,15 +57,21 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
 from auth import (
+    DEFAULT_BROWSER_DIR,
     DEFAULT_PORT,
+    DEFAULT_SESSION_FILE,
     DEFAULT_TOKEN_FILE,
     delete_token,
+    delete_web_session,
+    has_browser_profile,
     is_token_expired,
     load_token,
+    load_web_session,
     run_oauth_flow,
     save_token,
+    save_web_session,
 )
-from client import LinkedInClient
+from client import LinkedInClient, VoyagerClient
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────
 
@@ -100,6 +114,15 @@ def _get_client() -> LinkedInClient:
             "Run `authenticate` again to refresh it."
         )
     return LinkedInClient(token_data["access_token"])
+
+
+def _get_voyager_client() -> Optional[VoyagerClient]:
+    """Return a VoyagerClient backed by the persistent browser profile, or None."""
+    session = load_web_session()
+    if not session:
+        return None
+    user_data_dir = DEFAULT_BROWSER_DIR if has_browser_profile() else None
+    return VoyagerClient(session["li_at"], session["jsessionid"], user_data_dir=user_data_dir)
 
 
 def _format_error(exc: Exception) -> str:
@@ -145,17 +168,28 @@ def authenticate() -> str:
         client_id, client_secret = _credentials()
         port = DEFAULT_PORT
 
-        token_data = run_oauth_flow(client_id, client_secret, port=port)
+        token_data, li_at, jsessionid = run_oauth_flow(client_id, client_secret, port=port)
         save_token(token_data)
 
         scopes = token_data.get("scope", "unknown")
         expires_in = token_data.get("expires_in", "unknown")
 
+        session_note = ""
+        if li_at and jsessionid:
+            save_web_session(li_at, jsessionid)
+            session_note = f"   Web session    : saved to {DEFAULT_SESSION_FILE} (Voyager API enabled)\n"
+        else:
+            session_note = (
+                "   Web session    : not captured (run `set_web_session` manually to enable\n"
+                "                    full profile read/write via Voyager API)\n"
+            )
+
         return (
             "✅ Successfully authenticated with LinkedIn!\n"
             f"   Scopes granted : {scopes}\n"
             f"   Expires in     : {expires_in} seconds\n"
-            f"   Token saved to : {DEFAULT_TOKEN_FILE}\n\n"
+            f"   Token saved to : {DEFAULT_TOKEN_FILE}\n"
+            f"{session_note}\n"
             "You can now use `get_profile`, `create_post`, and other tools."
         )
     except Exception as exc:
@@ -236,24 +270,40 @@ def get_profile() -> str:
         email = info.get("email", "N/A")
         locale = info.get("locale", {})
 
-        # Attempt to get headline from /v2/me (may or may not include it depending on scopes)
-        headline = "N/A"
+        headline = ""
         vanity = ""
-        try:
-            me = client.get_profile()
-            hl = me.get("headline", {})
-            if isinstance(hl, dict):
-                localized = hl.get("localized", {})
-                headline = list(localized.values())[0] if localized else "N/A"
-            elif isinstance(hl, str):
-                headline = hl
-            vanity = me.get("vanityName", "")
-        except Exception:
-            pass
+        source = "oauth"
+
+        # Prefer Voyager when a web session is available — it has no scope restrictions.
+        voyager = _get_voyager_client()
+        if voyager:
+            try:
+                vme = voyager.get_me()
+                headline = vme.get("headline", "")
+                vanity = vme.get("public_id", "")
+                if vme.get("picture_url"):
+                    picture = vme["picture_url"]
+                source = "voyager"
+            except Exception as ve:
+                headline = f"Voyager error: {ve}"
+
+        # Fall back to /v2/me (likely 403 without partner scopes, kept for completeness)
+        if not headline and source == "oauth":
+            try:
+                me = client.get_profile()
+                hl = me.get("headline", {})
+                if isinstance(hl, dict):
+                    localized = hl.get("localized", {})
+                    headline = list(localized.values())[0] if localized else ""
+                elif isinstance(hl, str):
+                    headline = hl
+                vanity = me.get("vanityName", "")
+            except Exception as e:
+                headline = f"Not accessible via OAuth ({e}). Use set_web_session for full access."
 
         profile_url = (
             f"https://www.linkedin.com/in/{vanity}" if vanity
-            else f"https://www.linkedin.com/in/~"
+            else "https://www.linkedin.com/in/~"
         )
 
         result = {
@@ -265,6 +315,7 @@ def get_profile() -> str:
             "picture_url": picture,
             "locale": locale,
             "person_urn": f"urn:li:person:{person_id}",
+            "headline_source": source,
         }
         return json.dumps(result, indent=2)
     except Exception as exc:
@@ -289,12 +340,96 @@ def update_headline(
     """
     if len(headline) > 220:
         return f"❌ Headline is {len(headline)} characters. LinkedIn allows a maximum of 220."
+
+    # Prefer Voyager — works without partner-level OAuth scopes.
+    voyager = _get_voyager_client()
+    if voyager:
+        try:
+            # Need the public_id (vanity name) to build the PATCH URL.
+            vme = voyager.get_me()
+            public_id = vme.get("public_id", "")
+            if not public_id:
+                return "❌ Could not determine your LinkedIn public ID from the web session."
+            voyager.update_headline(headline, public_id)
+            return f"✅ Headline updated via web session:\n  \"{headline}\""
+        except Exception as exc:
+            return (
+                f"⚠️  Voyager update failed: {_format_error(exc)}\n"
+                "Falling back to OAuth API..."
+            ) + _try_oauth_headline(headline, locale)
+
+    return _try_oauth_headline(headline, locale)
+
+
+def _try_oauth_headline(headline: str, locale: str) -> str:
     try:
         client = _get_client()
         client.update_headline(headline, locale=locale)
-        return f"✅ Headline updated to:\n  \"{headline}\""
+        return f"✅ Headline updated via OAuth:\n  \"{headline}\""
     except Exception as exc:
         return _format_error(exc)
+
+
+@mcp.tool()
+def set_web_session(li_at: str, jsessionid: str) -> str:
+    """
+    Store LinkedIn browser session cookies for Voyager API access.
+
+    This unlocks full profile read/write (headline, and more) without needing
+    LinkedIn partner-program approval, by using the same internal API as
+    LinkedIn's own web app.
+
+    How to get your cookies (one-time setup, cookies last ~1 year):
+      1. Open linkedin.com in your browser and make sure you are logged in.
+      2. Open DevTools → Application (Chrome) or Storage (Firefox) → Cookies
+         → https://www.linkedin.com
+      3. Copy the value of:
+           li_at       — a long alphanumeric string
+           JSESSIONID  — looks like "ajax:1234567890123456789" (copy with or without quotes)
+      4. Pass both values to this tool.
+
+    Args:
+        li_at:      Value of the li_at cookie from linkedin.com.
+        jsessionid: Value of the JSESSIONID cookie from linkedin.com.
+    """
+    li_at = li_at.strip()
+    jsessionid = jsessionid.strip()
+    if not li_at or not jsessionid:
+        return "❌ Both li_at and jsessionid are required."
+
+    try:
+        # Quick sanity check — try fetching the profile before saving.
+        vc = VoyagerClient(li_at, jsessionid)
+        me = vc.get_me()
+        name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
+        headline = me.get("headline", "")
+        save_web_session(li_at, jsessionid)
+        return (
+            f"✅ Web session saved to {DEFAULT_SESSION_FILE}\n"
+            f"   Verified as  : {name}\n"
+            f"   Headline     : {headline or '(not set)'}\n\n"
+            "get_profile and update_headline will now use the Voyager API automatically."
+        )
+    except Exception as exc:
+        return (
+            f"❌ Session validation failed — cookies may be invalid or expired.\n"
+            f"   {_format_error(exc)}\n\n"
+            "Make sure you are still logged in to linkedin.com and copied the correct cookie values."
+        )
+
+
+@mcp.tool()
+def clear_web_session() -> str:
+    """
+    Remove the stored LinkedIn browser session cookies.
+
+    After clearing, get_profile and update_headline fall back to the OAuth API
+    (which cannot read/write the headline without partner-level scopes).
+    """
+    existed = delete_web_session()
+    if existed:
+        return f"✅ Web session cleared ({DEFAULT_SESSION_FILE} deleted)."
+    return "ℹ️ No web session found — nothing to clear."
 
 
 @mcp.tool()
@@ -417,6 +552,93 @@ def delete_post(post_urn: str) -> str:
 
 
 @mcp.tool()
+def get_full_profile(public_id: str = "") -> str:
+    """
+    Fetch complete LinkedIn profile sections via browser automation.
+
+    Returns about/summary, experience, education, and skills sections
+    scraped directly from linkedin.com — no partner-program API access required.
+
+    Args:
+        public_id: LinkedIn vanity name (e.g. "john-doe").
+                   Leave empty to fetch your own profile.
+
+    Requires a web session (run `authenticate` first).
+    """
+    try:
+        voyager = _get_voyager_client()
+        if not voyager:
+            return "❌ Web session required. Run `authenticate` first."
+
+        if not public_id:
+            me = voyager.get_me()
+            public_id = me.get("public_id", "")
+            if not public_id:
+                return "❌ Could not determine your LinkedIn public ID."
+
+        sections = voyager.get_profile_sections(public_id)
+        return json.dumps({"public_id": public_id, "sections": sections}, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        return _format_error(exc)
+
+
+@mcp.tool()
+def get_notifications(count: int = 20) -> str:
+    """
+    Fetch your recent LinkedIn notifications.
+
+    Args:
+        count: Number of notifications to retrieve (max 50, default 20).
+
+    Requires a web session (run `authenticate` first).
+    """
+    count = max(1, min(count, 50))
+    try:
+        voyager = _get_voyager_client()
+        if not voyager:
+            return "❌ Web session required. Run `authenticate` first."
+
+        items = voyager.get_notifications(count=count)
+        return json.dumps(
+            {"total_returned": len(items), "notifications": items},
+            indent=2,
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        return _format_error(exc)
+
+
+@mcp.tool()
+def get_conversations(count: int = 20) -> str:
+    """
+    Fetch your recent LinkedIn direct message conversations.
+
+    Args:
+        count: Number of conversations to retrieve (default 20).
+
+    Requires a web session (run `authenticate` first).
+    """
+    try:
+        voyager = _get_voyager_client()
+        if not voyager:
+            return "❌ Web session required. Run `authenticate` first."
+
+        me = voyager.get_me()
+        entity_urn = me.get("entity_urn", "")
+        if not entity_urn:
+            return "❌ Could not determine your LinkedIn entity URN."
+
+        items = voyager.get_conversations(entity_urn, count=count)
+        return json.dumps(
+            {"total_returned": len(items), "conversations": items},
+            indent=2,
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        return _format_error(exc)
+
+
+@mcp.tool()
 def get_api_capabilities() -> str:
     """
     Explain what the LinkedIn standard Consumer API can and cannot do.
@@ -429,51 +651,30 @@ def get_api_capabilities() -> str:
 
     capabilities = {
         "current_scopes": scopes,
-        "available": {
+        "oauth_api_available": {
             "get_profile": "✅ Name, headline, email, profile picture, person URN",
             "create_post": "✅ Publish text posts (PUBLIC or CONNECTIONS visibility)",
             "get_posts": "✅ List your recent posts with text preview",
             "delete_post": "✅ Remove a post you published",
             "update_headline": (
                 "⚠️  Requires `rw_me` scope — most standard apps receive 403. "
-                "Check whether your LinkedIn Developer App has this scope approved."
+                "Voyager (web session) is more reliable for this."
             ),
         },
-        "unavailable_standard_api": {
-            "experience_entries": (
-                "❌ Read/write work experience requires the restricted Profile API "
-                "(LinkedIn partner program). Not available to standard apps."
-            ),
-            "education": (
-                "❌ Same restriction as experience — partner program required."
-            ),
-            "certifications_licenses": (
-                "❌ Same restriction — partner program required."
-            ),
-            "skills_endorsements": (
-                "❌ Same restriction — partner program required."
-            ),
-            "about_summary": (
-                "❌ Reading/updating the 'About' section (summary) requires "
-                "r_basicprofile scope, which is partner-gated."
-            ),
-            "connections_list": (
-                "❌ r_network scope is partner-gated. "
-                "Connection counts and lists are unavailable."
-            ),
-            "send_messages": (
-                "❌ w_messages scope is not available in the Consumer API."
-            ),
-            "send_connection_requests": (
-                "❌ w_connections scope is partner-gated."
-            ),
+        "voyager_available_after_authenticate": {
+            "get_profile": "✅ Full headline via Voyager (no partner scope needed)",
+            "update_headline": "✅ Works reliably via Voyager PATCH",
+            "get_full_profile": "✅ About, experience, education, skills — scraped via browser DOM",
+            "get_notifications": "✅ Recent notifications via Voyager REST endpoint",
+            "get_conversations": "✅ Recent DM conversations via Voyager GraphQL",
         },
-        "workaround": (
-            "For profile sections not accessible via the API (experience, "
-            "certifications, skills, about), use 'Claude in Chrome' browser "
-            "automation — Claude can interact with linkedin.com directly through "
-            "the Chrome extension without needing API access."
-        ),
+        "not_available": {
+            "send_messages": "❌ w_messages scope not in Consumer API; Voyager write for messages not implemented",
+            "send_connection_requests": "❌ w_connections scope is partner-gated",
+            "reactions": "❌ Not exposed via Voyager without specific post URNs",
+            "search_people": "❌ Voyager search GraphQL queryId not yet captured",
+            "connections_list": "❌ Voyager connections GraphQL queryId not yet captured",
+        },
         "linkedin_partner_program": "https://business.linkedin.com/marketing-solutions/partner-program",
     }
 

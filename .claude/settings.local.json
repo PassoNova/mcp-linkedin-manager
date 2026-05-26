@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__linkedin-manager__check_auth",
+      "mcp__linkedin-manager__get_profile",
+      "mcp__linkedin-manager__update_headline",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\('/Users/sergiocarrerorodriguez/.linkedin_mcp_token.json'\\)\\); print\\(d['access_token']\\)\")",
+      "Bash(curl -s https://api.linkedin.com/v2/userinfo -H 'Authorization: Bearer __TRACKED_VAR__')",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s 'https://api.linkedin.com/v2/me?projection=\\(id,firstName,lastName,headline,vanityName\\)' -H 'Authorization: Bearer __TRACKED_VAR__' -H 'X-Restli-Protocol-Version: 2.0.0')",
+      "Bash(curl -s https://api.linkedin.com/rest/me -H 'Authorization: Bearer __TRACKED_VAR__' -H 'LinkedIn-Version: 202504' -H 'X-Restli-Protocol-Version: 2.0.0')",
+      "Bash(curl -s 'https://api.linkedin.com/v2/me?projection=\\(id,localizedHeadline,vanityName\\)' -H 'Authorization: Bearer __TRACKED_VAR__' -H 'X-Restli-Protocol-Version: 2.0.0')",
+      "WebSearch",
+      "Bash(python -c \"import server; print\\('OK'\\)\")",
+      "Bash(python *)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/playwright install *)",
+      "Bash(uv add *)",
+      "Bash(uv run *)",
+      "mcp__linkedin-manager__authenticate",
+      "Bash(python3 -c \"import playwright; print\\('playwright installed'\\)\")",
+      "Bash(pip3 install *)",
+      "Bash(python3 -m playwright install chromium)",
+      "mcp__linkedin-manager__set_web_session",
+      "Bash(python3 *)",
+      "Read(//Users/sergiocarrerorodriguez/.claude/**)",
+      "Read(//Users/sergiocarrerorodriguez/.config/claude/**)",
+      "Bash(claude mcp *)",
+      "Read(//private/var/folders/xj/t3d526r9359c58_v0npn1xqm0000gn/T/claude-hostloop-plugins/**)",
+      "Read(//var/folders/xj/t3d526r9359c58_v0npn1xqm0000gn/T/claude-hostloop-plugins/f26d12ef15cdf64b/mcp/**)",
+      "Bash(/Users/sergiocarrerorodriguez/ai/mcp/servers/linkedin-mcp/.venv/bin/python --version)",
+      "Bash(kill 91049)",
+      "Bash(pkill -f \"server.py\")",
+      "Bash(.venv/bin/python *)",
+      "mcp__linkedin-manager__get_full_profile"
+    ]
+  }
+}
