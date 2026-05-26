@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "linkedin-manager": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/var/folders/xj/t3d526r9359c58_v0npn1xqm0000gn/T/claude-hostloop-plugins/f26d12ef15cdf64b/mcp",
+        "python",
+        "server.py"
+      ],
+      "env": {
+        "LINKEDIN_CLIENT_ID": "${LINKEDIN_CLIENT_ID}",
+        "LINKEDIN_CLIENT_SECRET": "${LINKEDIN_CLIENT_SECRET}"
+      }
+    }
+  }
+}

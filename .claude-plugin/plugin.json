@@ -1,0 +1,10 @@
+{
+  "name": "linkedin-mcp",
+  "version": "0.1.0",
+  "description": "Manage your LinkedIn profile, posts, and certifications directly from Claude using the official LinkedIn API.",
+  "author": {
+    "name": "Sergio Carrero"
+  },
+  "keywords": ["linkedin", "profile", "posts", "social", "mcp"],
+  "mcpServers": "./.mcp.json"
+}

@@ -1,0 +1,30 @@
+# Credentials — never commit these
+.env
+*.env
+!.env.example
+
+# OAuth token
+.linkedin_mcp_token.json
+~/.linkedin_mcp_token.json
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# uv
+# uv.lock is intentionally kept — it pins exact dependency versions
+# Remove the next line if you prefer not to pin
+# uv.lock
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
