@@ -69,6 +69,20 @@ from client import LinkedInClient, VoyagerClient
 
 load_dotenv()
 
+def _git_version() -> str:
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(__file__),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+_SERVER_VERSION = _git_version()
+
 mcp = FastMCP(
     "LinkedIn Manager",
     instructions=dedent("""
@@ -223,6 +237,7 @@ def check_auth() -> str:
                 "authenticated": False,
                 "tier": "BASE",
                 "message": "No token found. Run `authenticate` to log in.",
+                "server_version": _SERVER_VERSION,
             },
             indent=2,
         )
@@ -251,6 +266,7 @@ def check_auth() -> str:
                 else "unknown"
             ),
             "token_file": DEFAULT_TOKEN_FILE,
+            "server_version": _SERVER_VERSION,
         },
         indent=2,
     )
