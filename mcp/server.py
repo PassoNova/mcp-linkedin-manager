@@ -53,13 +53,16 @@ from auth import (
     DEFAULT_PORT,
     DEFAULT_SESSION_FILE,
     DEFAULT_TOKEN_FILE,
+    delete_credentials,
     delete_token,
     delete_web_session,
     has_browser_profile,
     is_token_expired,
+    load_credentials,
     load_token,
     load_web_session,
     run_oauth_flow,
+    save_credentials,
     save_token,
     save_web_session,
 )
@@ -97,13 +100,19 @@ mcp = FastMCP(
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 def _credentials() -> tuple[str, str]:
+    creds = load_credentials()
+    if creds:
+        return creds["client_id"], creds["client_secret"]
     client_id = os.environ.get("LINKEDIN_CLIENT_ID", "").strip()
     client_secret = os.environ.get("LINKEDIN_CLIENT_SECRET", "").strip()
     if not client_id or not client_secret:
         raise RuntimeError(
-            "LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET must be set. "
-            "Copy .env.example → .env and fill in your Developer App credentials."
+            "LinkedIn app credentials not found. Run `python -m linkedin_mcp setup` "
+            "to save them to the OS keychain, or set LINKEDIN_CLIENT_ID and "
+            "LINKEDIN_CLIENT_SECRET in your environment or .env file."
         )
+    # Auto-migrate env-var credentials to keychain on first use.
+    save_credentials(client_id, client_secret)
     return client_id, client_secret
 
 
@@ -253,13 +262,17 @@ def check_auth() -> str:
       OAUTH   — valid token, OAuth tools available
       VOYAGER — valid token + browser session, all tools available
     """
+    from auth import _HAS_KEYRING
     token_data = load_token()
+    credentials_in_keychain = load_credentials() is not None
 
     if not token_data:
         return json.dumps(
             {
                 "authenticated": False,
                 "tier": "BASE",
+                "keychain_available": _HAS_KEYRING,
+                "credentials_in_keychain": credentials_in_keychain,
                 "message": "No token found. Run `authenticate` to log in.",
                 "server_version": _SERVER_VERSION,
             },
@@ -289,7 +302,8 @@ def check_auth() -> str:
                 if expiry_ts
                 else "unknown"
             ),
-            "token_file": DEFAULT_TOKEN_FILE,
+            "keychain_available": _HAS_KEYRING,
+            "credentials_in_keychain": credentials_in_keychain,
             "server_version": _SERVER_VERSION,
         },
         indent=2,
@@ -480,6 +494,25 @@ def clear_web_session() -> str:
     if existed:
         return f"✅ Web session cleared ({DEFAULT_SESSION_FILE} deleted)."
     return "ℹ️ No web session found — nothing to clear."
+
+
+@mcp.tool()
+def clear_credentials() -> str:
+    """
+    Remove LinkedIn app credentials (Client ID + Secret) from the OS keychain.
+
+    After clearing, run `python -m linkedin_mcp setup` or set
+    LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET in your environment
+    before calling authenticate again.
+    """
+    removed = delete_credentials()
+    if removed:
+        return (
+            "✅ App credentials removed from the OS keychain.\n\n"
+            "Run `python -m linkedin_mcp setup` or set LINKEDIN_CLIENT_ID and "
+            "LINKEDIN_CLIENT_SECRET in your environment to re-add them."
+        )
+    return "ℹ️ No credentials found in the OS keychain — nothing to clear."
 
 
 @mcp.tool()

@@ -37,6 +37,8 @@ except ImportError:
 
 _KR_SERVICE = "linkedin-mcp"
 _KR_KEY = "session"
+_KR_KEY_TOKEN = "oauth_token"
+_KR_KEY_CREDS = "credentials"
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -321,7 +323,13 @@ def _run_oauth_flow_browser(client_id: str, client_secret: str, port: int) -> di
 # ── Token persistence ──────────────────────────────────────────────────────────
 
 def save_token(token_data: dict, path: str = DEFAULT_TOKEN_FILE) -> None:
-    """Persist *token_data* to *path* (mode 0o600)."""
+    """Persist token_data to OS keychain, falling back to path (mode 0o600)."""
+    if _HAS_KEYRING:
+        try:
+            keyring.set_password(_KR_SERVICE, _KR_KEY_TOKEN, json.dumps(token_data))
+            return
+        except Exception:
+            pass
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as fh:
         json.dump(token_data, fh, indent=2)
@@ -329,7 +337,14 @@ def save_token(token_data: dict, path: str = DEFAULT_TOKEN_FILE) -> None:
 
 
 def load_token(path: str = DEFAULT_TOKEN_FILE) -> Optional[dict]:
-    """Load a previously saved token. Returns None if the file doesn't exist."""
+    """Load saved token, checking OS keychain first then file."""
+    if _HAS_KEYRING:
+        try:
+            raw = keyring.get_password(_KR_SERVICE, _KR_KEY_TOKEN)
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
     if not os.path.exists(path):
         return None
     with open(path) as fh:
@@ -350,11 +365,18 @@ def is_token_expired(token_data: dict, buffer_seconds: int = 300) -> bool:
 
 
 def delete_token(path: str = DEFAULT_TOKEN_FILE) -> bool:
-    """Remove the saved token. Returns True if the file existed."""
+    """Remove saved token from keychain and/or file. Returns True if anything was deleted."""
+    deleted = False
+    if _HAS_KEYRING:
+        try:
+            keyring.delete_password(_KR_SERVICE, _KR_KEY_TOKEN)
+            deleted = True
+        except Exception:
+            pass
     if os.path.exists(path):
         os.remove(path)
-        return True
-    return False
+        deleted = True
+    return deleted
 
 
 # ── Web session persistence (Voyager cookies) ──────────────────────────────────
@@ -406,3 +428,39 @@ def delete_web_session(path: str = DEFAULT_SESSION_FILE) -> bool:
         os.remove(path)
         deleted = True
     return deleted
+
+
+# ── App credential persistence ─────────────────────────────────────────────────
+
+def save_credentials(client_id: str, client_secret: str) -> bool:
+    """Store app credentials in OS keychain. Returns True if saved, False if keyring unavailable."""
+    if not _HAS_KEYRING:
+        return False
+    try:
+        data = {"client_id": client_id, "client_secret": client_secret}
+        keyring.set_password(_KR_SERVICE, _KR_KEY_CREDS, json.dumps(data))
+        return True
+    except Exception:
+        return False
+
+
+def load_credentials() -> Optional[dict]:
+    """Load app credentials from OS keychain. Returns None if not stored or keyring unavailable."""
+    if not _HAS_KEYRING:
+        return None
+    try:
+        raw = keyring.get_password(_KR_SERVICE, _KR_KEY_CREDS)
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+def delete_credentials() -> bool:
+    """Remove app credentials from OS keychain. Returns True if they existed."""
+    if not _HAS_KEYRING:
+        return False
+    try:
+        keyring.delete_password(_KR_SERVICE, _KR_KEY_CREDS)
+        return True
+    except Exception:
+        return False
