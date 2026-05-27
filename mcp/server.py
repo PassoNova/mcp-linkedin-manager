@@ -232,7 +232,7 @@ async def authenticate(alias: str) -> str:
         validate_alias(alias)
         client_id, client_secret = _credentials()
 
-        token_data, li_at, jsessionid = await run_oauth_flow(
+        token_data, li_at, jsessionid, session_err = await run_oauth_flow(
             client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
         )
         save_token(token_data, alias)
@@ -242,13 +242,18 @@ async def authenticate(alias: str) -> str:
         scopes = token_data.get("scope", "unknown")
         expires_in = token_data.get("expires_in", "unknown")
 
-        if li_at and jsessionid:
-            save_web_session(li_at, jsessionid, alias)
-            session_note = "   Web session    : captured automatically (Voyager API enabled)\n"
+        if li_at:
+            save_web_session(li_at, jsessionid or "", alias)
+            tier_note = "Voyager API enabled" if jsessionid else "Voyager API enabled (JSESSIONID will be refreshed on first use)"
+            session_note = f"   Web session    : captured automatically ({tier_note})\n"
+        elif session_err:
+            session_note = (
+                f"   Web session    : not captured ({session_err})\n"
+                "                    Run `authenticate` again to retry.\n"
+            )
         else:
             session_note = (
-                "   Web session    : not captured — run `set_web_session` manually\n"
-                "                    to enable full profile read/write via Voyager API\n"
+                "   Web session    : not captured — run `authenticate` again to retry\n"
             )
 
         return (
@@ -506,16 +511,19 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
     """
     li_at = li_at.strip()
     jsessionid = jsessionid.strip()
-    if not li_at or not jsessionid:
-        return "❌ Both li_at and jsessionid are required."
+    if not li_at:
+        return "❌ li_at is required."
 
     try:
-        # Quick sanity check — try fetching the profile before saving.
-        vc = VoyagerClient(li_at, jsessionid)
+        active = _active_alias()
+        # Validate using the existing browser profile — VoyagerClient requires the
+        # persistent Chromium profile to bypass LinkedIn's TLS fingerprinting.
+        bdir = _browser_dir(active)
+        udd = bdir if has_browser_profile(bdir) else None
+        vc = VoyagerClient(li_at, jsessionid, user_data_dir=udd)
         me = vc.get_me()
         name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
         headline = me.get("headline", "")
-        active = _active_alias()
         save_web_session(li_at, jsessionid, active)
         _invalidate_voyager(active)
         return (
@@ -526,9 +534,9 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
         )
     except Exception as exc:
         return (
-            f"❌ Session validation failed — cookies may be invalid or expired.\n"
+            f"❌ Session validation failed — browser profile may not have a valid LinkedIn session.\n"
             f"   {_format_error(exc)}\n\n"
-            "Make sure you are still logged in to linkedin.com and copied the correct cookie values."
+            "Run `authenticate` first to set up the browser profile, then try again."
         )
 
 
