@@ -32,7 +32,31 @@
       "Bash(kill 91049)",
       "Bash(pkill -f \"server.py\")",
       "Bash(.venv/bin/python *)",
-      "mcp__linkedin-manager__get_full_profile"
+      "mcp__linkedin-manager__get_full_profile",
+      "Bash(git -C /Users/sergiocarrerorodriguez/ai/mcp/servers/linkedin-mcp log --oneline -3)",
+      "Bash(git -C /Users/sergiocarrerorodriguez/ai/mcp/servers/linkedin-mcp push --force-with-lease origin fix/auto-tag-trigger-release)",
+      "Bash(gh pr *)",
+      "Bash(gh run *)",
+      "Bash(git -C /Users/sergiocarrerorodriguez/ai/mcp/servers/linkedin-mcp checkout main)",
+      "Bash(git -C /Users/sergiocarrerorodriguez/ai/mcp/servers/linkedin-mcp pull origin main)",
+      "Bash(git -C /Users/sergiocarrerorodriguez/ai/mcp/servers/linkedin-mcp checkout -b fix/consolidate-auto-release)",
+      "Bash(git -C /Users/sergiocarrerorodriguez/ai/mcp/servers/linkedin-mcp add .github/workflows/auto-tag.yml)",
+      "Bash(git -C /Users/sergiocarrerorodriguez/ai/mcp/servers/linkedin-mcp commit -m ' *)",
+      "Bash(git -C /Users/sergiocarrerorodriguez/ai/mcp/servers/linkedin-mcp push -u origin fix/consolidate-auto-release)",
+      "Bash(gh release *)",
+      "Bash(git *)",
+      "Bash(pip show *)",
+      "Bash(pip uninstall *)",
+      "Bash(rm -rf ~/linkedin-mcp-install)",
+      "Bash(mkdir ~/linkedin-mcp-install)",
+      "Bash(unzip ~/linkedin-mcp-install/linkedin-mcp.plugin -d ~/linkedin-mcp-install)",
+      "Bash(unzip -q ~/linkedin-mcp-install/linkedin-mcp.plugin -d ~/linkedin-mcp-install)",
+      "Bash(uv sync *)",
+      "Bash(security find-generic-password *)",
+      "Bash(md5 /tmp/v1.0.0.plugin /tmp/v1.0.6.plugin)",
+      "Bash(unzip -l /tmp/v1.0.0.plugin)",
+      "Bash(unzip -l /tmp/v1.0.6.plugin)",
+      "Bash(xxd)"
     ]
   }
 }
