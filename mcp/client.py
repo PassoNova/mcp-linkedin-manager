@@ -33,7 +33,7 @@ VOYAGER_BASE = "https://www.linkedin.com/voyager/api"
 
 # LinkedIn requires these headers on all v2 REST calls.
 # LinkedIn-Version pins the API version; without it some finders return NO_VERSION errors.
-RESTLI_HEADER = {"X-Restli-Protocol-Version": "2.0.0", "LinkedIn-Version": "202401"}
+RESTLI_HEADER = {"X-Restli-Protocol-Version": "2.0.0", "LinkedIn-Version": "202506"}
 
 
 class LinkedInClient:

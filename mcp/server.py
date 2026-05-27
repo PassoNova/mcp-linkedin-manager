@@ -575,14 +575,15 @@ def get_posts(count: int = 10) -> str:
             indent=2,
         )
     except Exception as exc:
-        if not (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 403):
+        _OAUTH_FALLBACK_CODES = {403, 426}
+        if not (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in _OAUTH_FALLBACK_CODES):
             return _format_error(exc)
 
-    # OAuth lacks r_member_social scope — fall back to Voyager browser scraper.
+    # OAuth lacks r_member_social scope (or version mismatch) — fall back to Voyager.
     try:
         voyager = _get_voyager_client()
         if not voyager:
-            return "❌ OAuth API returned 403 (partner scope required) and no web session is set. Run `authenticate` or `set_web_session` to enable Voyager fallback."
+            return "❌ OAuth API is unavailable (scope or version issue) and no web session is set. Run `authenticate` or `set_web_session` to enable Voyager fallback."
         me = voyager.get_me()
         public_id = me.get("public_id", "")
         if not public_id:
