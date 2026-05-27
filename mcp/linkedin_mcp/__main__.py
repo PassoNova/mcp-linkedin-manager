@@ -10,7 +10,9 @@ import getpass
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(__file__))
+# mcp/ directory (parent of this linkedin_mcp/ package) must be on sys.path
+# so that auth.py, server.py, etc. are importable without restructuring.
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 
 def setup() -> None:
