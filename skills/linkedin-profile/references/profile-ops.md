@@ -1,5 +1,8 @@
 # LinkedIn MCP — Profile Operations
 
+All profile operations run on the **active account** (set via `switch_user`).
+Use `list_users` to see which alias is currently active.
+
 ## Viewing profile
 
 Call `get_profile` and present the result clearly:
