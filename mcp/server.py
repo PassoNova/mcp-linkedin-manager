@@ -69,6 +69,20 @@ from client import LinkedInClient, VoyagerClient
 
 load_dotenv()
 
+def _git_version() -> str:
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(__file__),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+_SERVER_VERSION = _git_version()
+
 mcp = FastMCP(
     "LinkedIn Manager",
     instructions=dedent("""
@@ -108,13 +122,36 @@ def _get_client() -> LinkedInClient:
     return LinkedInClient(token_data["access_token"])
 
 
+_voyager_singleton: Optional[VoyagerClient] = None
+_voyager_session_key: Optional[str] = None
+
+
 def _get_voyager_client() -> Optional[VoyagerClient]:
-    """Return a VoyagerClient backed by the persistent browser profile, or None."""
+    """Return a reusable VoyagerClient, creating one only when the session changes."""
+    global _voyager_singleton, _voyager_session_key
     session = load_web_session()
     if not session:
         return None
-    user_data_dir = DEFAULT_BROWSER_DIR if has_browser_profile() else None
-    return VoyagerClient(session["li_at"], session["jsessionid"], user_data_dir=user_data_dir)
+    # Use li_at as the cache key — changes when the user re-authenticates.
+    key = session.get("li_at", "")
+    if _voyager_singleton is None or key != _voyager_session_key:
+        if _voyager_singleton is not None:
+            _voyager_singleton.close()
+        user_data_dir = DEFAULT_BROWSER_DIR if has_browser_profile() else None
+        _voyager_singleton = VoyagerClient(
+            session["li_at"], session["jsessionid"], user_data_dir=user_data_dir
+        )
+        _voyager_session_key = key
+    return _voyager_singleton
+
+
+def _invalidate_voyager_singleton() -> None:
+    """Call after set_web_session / clear_web_session / logout."""
+    global _voyager_singleton, _voyager_session_key
+    if _voyager_singleton is not None:
+        _voyager_singleton.close()
+    _voyager_singleton = None
+    _voyager_session_key = None
 
 
 def _format_error(exc: Exception) -> str:
@@ -197,6 +234,7 @@ def logout() -> str:
     using any other tool.
     """
     existed = delete_token()
+    _invalidate_voyager_singleton()
     if existed:
         return f"✅ Token deleted from {DEFAULT_TOKEN_FILE}. You are now logged out."
     return "ℹ️ No token file found — you were already logged out."
@@ -207,7 +245,13 @@ def check_auth() -> str:
     """
     Check whether you have a valid LinkedIn access token.
 
-    Returns token metadata (scopes, expiry) without making an API call.
+    Returns token metadata (scopes, expiry, and capability tier) without
+    making an API call.
+
+    Tier values:
+      BASE    — no valid token (not authenticated or expired)
+      OAUTH   — valid token, OAuth tools available
+      VOYAGER — valid token + browser session, all tools available
     """
     token_data = load_token()
 
@@ -215,7 +259,9 @@ def check_auth() -> str:
         return json.dumps(
             {
                 "authenticated": False,
+                "tier": "BASE",
                 "message": "No token found. Run `authenticate` to log in.",
+                "server_version": _SERVER_VERSION,
             },
             indent=2,
         )
@@ -225,10 +271,18 @@ def check_auth() -> str:
     expired = is_token_expired(token_data)
     expiry_ts = obtained_at + expires_in if (obtained_at and expires_in) else None
 
+    if expired:
+        tier = "BASE"
+    elif load_web_session():
+        tier = "VOYAGER"
+    else:
+        tier = "OAUTH"
+
     return json.dumps(
         {
             "authenticated": True,
             "expired": expired,
+            "tier": tier,
             "scopes": token_data.get("scope", "unknown"),
             "expires_at": (
                 time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expiry_ts))
@@ -236,6 +290,7 @@ def check_auth() -> str:
                 else "unknown"
             ),
             "token_file": DEFAULT_TOKEN_FILE,
+            "server_version": _SERVER_VERSION,
         },
         indent=2,
     )
@@ -276,8 +331,9 @@ def get_profile() -> str:
                 if vme.get("picture_url"):
                     picture = vme["picture_url"]
                 source = "voyager"
-            except Exception as ve:
-                headline = f"Voyager error: {ve}"
+            except Exception:
+                # Voyager unavailable (e.g. playwright not installed) — fall through to OAuth
+                pass
 
         # Fall back to /v2/me (likely 403 without partner scopes, kept for completeness)
         if not headline and source == "oauth":
@@ -290,8 +346,8 @@ def get_profile() -> str:
                 elif isinstance(hl, str):
                     headline = hl
                 vanity = me.get("vanityName", "")
-            except Exception as e:
-                headline = f"Not accessible via OAuth ({e}). Use set_web_session for full access."
+            except Exception:
+                headline = ""  # /v2/me requires partner scopes; not available via standard OAuth
 
         profile_url = (
             f"https://www.linkedin.com/in/{vanity}" if vanity
@@ -396,6 +452,7 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
         name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
         headline = me.get("headline", "")
         save_web_session(li_at, jsessionid)
+        _invalidate_voyager_singleton()
         return (
             f"✅ Web session saved to {DEFAULT_SESSION_FILE}\n"
             f"   Verified as  : {name}\n"
@@ -419,6 +476,7 @@ def clear_web_session() -> str:
     (which cannot read/write the headline without partner-level scopes).
     """
     existed = delete_web_session()
+    _invalidate_voyager_singleton()
     if existed:
         return f"✅ Web session cleared ({DEFAULT_SESSION_FILE} deleted)."
     return "ℹ️ No web session found — nothing to clear."
@@ -468,9 +526,43 @@ def create_post(
 
 
 @mcp.tool()
+def get_recent_activity(count: int = 10) -> str:
+    """
+    List your recent LinkedIn posts via browser session (no partner scope needed).
+
+    Scrapes your LinkedIn activity page — works even when the OAuth token
+    lacks the r_member_social scope required by the official API.
+
+    Args:
+        count: Number of posts to retrieve (max 50, default 10).
+
+    Requires a web session (run `authenticate` or `set_web_session` first).
+    """
+    count = max(1, min(count, 50))
+    try:
+        voyager = _get_voyager_client()
+        if not voyager:
+            return "❌ Web session required. Run `authenticate` or `set_web_session` first."
+
+        me = voyager.get_me()
+        public_id = me.get("public_id", "")
+        if not public_id:
+            return "❌ Could not determine your LinkedIn public ID."
+
+        posts = voyager.get_recent_posts(public_id, count=count)
+        return json.dumps(
+            {"public_id": public_id, "total_returned": len(posts), "posts": posts},
+            indent=2,
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        return _format_error(exc)
+
+
+@mcp.tool()
 def get_posts(count: int = 10) -> str:
     """
-    List your recent LinkedIn UGC posts.
+    List your recent LinkedIn posts.
 
     Args:
         count: Number of posts to retrieve. Min 1, max 50. Default: 10.
@@ -486,14 +578,23 @@ def get_posts(count: int = 10) -> str:
 
         posts = []
         for el in elements:
-            content = el.get("specificContent", {}).get(
-                "com.linkedin.ugc.ShareContent", {}
-            )
-            text = content.get("shareCommentary", {}).get("text", "")
-            vis = el.get("visibility", {}).get(
-                "com.linkedin.ugc.MemberNetworkVisibility", "UNKNOWN"
-            )
-            created_ms = el.get("created", {}).get("time", 0)
+            # REST /rest/posts format: flat fields.
+            # Fallback handles legacy ugcPosts shape if ever returned.
+            text = el.get("commentary", "")
+            if not text:
+                content = el.get("specificContent", {}).get(
+                    "com.linkedin.ugc.ShareContent", {}
+                )
+                text = content.get("shareCommentary", {}).get("text", "")
+
+            vis = el.get("visibility", "")
+            if isinstance(vis, dict):
+                vis = vis.get("com.linkedin.ugc.MemberNetworkVisibility", "UNKNOWN")
+            vis = vis or "UNKNOWN"
+
+            created_ms = el.get("publishedAt") or el.get("lastModifiedAt", 0)
+            if not created_ms:
+                created_ms = el.get("created", {}).get("time", 0) if isinstance(el.get("created"), dict) else 0
             created_str = (
                 time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(created_ms / 1000))
                 if created_ms
@@ -514,6 +615,26 @@ def get_posts(count: int = 10) -> str:
         return json.dumps(
             {"total_returned": len(posts), "posts": posts},
             indent=2,
+        )
+    except Exception as exc:
+        _OAUTH_FALLBACK_CODES = {403, 426}
+        if not (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in _OAUTH_FALLBACK_CODES):
+            return _format_error(exc)
+
+    # OAuth lacks r_member_social scope (or version mismatch) — fall back to Voyager.
+    try:
+        voyager = _get_voyager_client()
+        if not voyager:
+            return "❌ OAuth API is unavailable (scope or version issue) and no web session is set. Run `authenticate` or `set_web_session` to enable Voyager fallback."
+        me = voyager.get_me()
+        public_id = me.get("public_id", "")
+        if not public_id:
+            return "❌ Could not determine your LinkedIn public ID for Voyager fallback."
+        posts = voyager.get_recent_posts(public_id, count=count)
+        return json.dumps(
+            {"source": "voyager", "total_returned": len(posts), "posts": posts},
+            indent=2,
+            ensure_ascii=False,
         )
     except Exception as exc:
         return _format_error(exc)

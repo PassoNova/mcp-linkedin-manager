@@ -28,6 +28,16 @@ try:
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
 
+try:
+    import keyring
+    import keyring.errors
+    _HAS_KEYRING = True
+except ImportError:
+    _HAS_KEYRING = False
+
+_KR_SERVICE = "linkedin-mcp"
+_KR_KEY = "session"
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
@@ -64,20 +74,37 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
     auth_code: Optional[str] = None
     error: Optional[str] = None
+    expected_state: Optional[str] = None
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
 
+        received_state = params.get("state", [None])[0]
+
         if "code" in params:
-            _CallbackHandler.auth_code = params["code"][0]
-            body = (
-                b"<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
-                b"<h2>&#10003; LinkedIn authorization successful!</h2>"
-                b"<p>You can close this window and return to Claude.</p>"
-                b"</body></html>"
-            )
-            self.send_response(200)
+            # Validate state token to prevent CSRF.
+            if _CallbackHandler.expected_state and received_state != _CallbackHandler.expected_state:
+                _CallbackHandler.error = (
+                    f"State mismatch in OAuth callback — possible CSRF attempt. "
+                    f"Expected {_CallbackHandler.expected_state!r}, got {received_state!r}."
+                )
+                body = (
+                    b"<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
+                    b"<h2>&#10007; Authorization failed</h2>"
+                    b"<p>State mismatch detected. Please close this window and try again.</p>"
+                    b"</body></html>"
+                )
+                self.send_response(400)
+            else:
+                _CallbackHandler.auth_code = params["code"][0]
+                body = (
+                    b"<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
+                    b"<h2>&#10003; LinkedIn authorization successful!</h2>"
+                    b"<p>You can close this window and return to Claude.</p>"
+                    b"</body></html>"
+                )
+                self.send_response(200)
         elif "error" in params:
             _CallbackHandler.error = params.get("error_description", params.get("error", ["Unknown error"]))[0]
             body = (
@@ -100,13 +127,18 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass  # suppress access logs
 
 
-def _wait_for_code(port: int, timeout: int = 120) -> tuple[Optional[str], Optional[str]]:
+def _wait_for_code(
+    port: int,
+    timeout: int = 120,
+    expected_state: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
     """
     Start a local HTTP server, wait up to *timeout* seconds for the OAuth
     callback, then shut down. Returns (code, error).
     """
     _CallbackHandler.auth_code = None
     _CallbackHandler.error = None
+    _CallbackHandler.expected_state = expected_state
 
     server = HTTPServer(("", port), _CallbackHandler)
 
@@ -223,6 +255,15 @@ def _run_oauth_flow_playwright(
 
     def _handle_callback(route: "PlaywrightRoute") -> None:
         params = urllib.parse.parse_qs(urllib.parse.urlparse(route.request.url).query)
+        received_state = params.get("state", [None])[0]
+        if received_state != state:
+            route.fulfill(
+                status=400,
+                content_type="text/html",
+                body="<html><body>State mismatch — possible CSRF attempt.</body></html>",
+            )
+            captured_code[0] = None
+            return
         captured_code[0] = params.get("code", [None])[0]
         route.fulfill(status=200, content_type="text/html", body=_SUCCESS_HTML)
 
@@ -265,7 +306,7 @@ def _run_oauth_flow_browser(client_id: str, client_secret: str, port: int) -> di
     auth_url = build_auth_url(client_id, redirect_uri, state)
 
     webbrowser.open(auth_url)
-    code, error = _wait_for_code(port)
+    code, error = _wait_for_code(port, expected_state=state)
 
     if error:
         raise RuntimeError(f"LinkedIn authorization failed: {error}")
@@ -323,8 +364,14 @@ def save_web_session(
     jsessionid: str,
     path: str = DEFAULT_SESSION_FILE,
 ) -> None:
-    """Persist li_at and JSESSIONID cookies for Voyager API access."""
+    """Persist li_at and JSESSIONID cookies, preferring OS keychain over plaintext file."""
     data = {"li_at": li_at, "jsessionid": jsessionid, "_saved_at": int(time.time())}
+    if _HAS_KEYRING:
+        try:
+            keyring.set_password(_KR_SERVICE, _KR_KEY, json.dumps(data))
+            return
+        except Exception:
+            pass
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as fh:
         json.dump(data, fh, indent=2)
@@ -332,7 +379,14 @@ def save_web_session(
 
 
 def load_web_session(path: str = DEFAULT_SESSION_FILE) -> Optional[dict]:
-    """Load saved web session cookies. Returns None if not found."""
+    """Load saved web session cookies, checking keychain first then file."""
+    if _HAS_KEYRING:
+        try:
+            raw = keyring.get_password(_KR_SERVICE, _KR_KEY)
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
     if not os.path.exists(path):
         return None
     with open(path) as fh:
@@ -340,8 +394,15 @@ def load_web_session(path: str = DEFAULT_SESSION_FILE) -> Optional[dict]:
 
 
 def delete_web_session(path: str = DEFAULT_SESSION_FILE) -> bool:
-    """Remove saved web session. Returns True if the file existed."""
+    """Remove saved web session from keychain and/or file. Returns True if anything was deleted."""
+    deleted = False
+    if _HAS_KEYRING:
+        try:
+            keyring.delete_password(_KR_SERVICE, _KR_KEY)
+            deleted = True
+        except Exception:
+            pass
     if os.path.exists(path):
         os.remove(path)
-        return True
-    return False
+        deleted = True
+    return deleted

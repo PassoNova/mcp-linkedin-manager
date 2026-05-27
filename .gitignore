@@ -21,6 +21,9 @@ build/
 # Remove the next line if you prefer not to pin
 # uv.lock
 
+# Stale build artifacts
+ziOOKT8u
+
 # macOS
 .DS_Store
 

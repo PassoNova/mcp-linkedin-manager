@@ -19,19 +19,69 @@ LinkedIn API surface used here:
 
 from __future__ import annotations
 
+import atexit
 import json
+import os
+import threading
+import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import httpx
 
+try:
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    _PLAYWRIGHT_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _sync_playwright = None  # type: ignore[assignment]
+    _PLAYWRIGHT_AVAILABLE = False
+
+from cache import SimpleCache
+
+# ---------------------------------------------------------------------------
+# Cache TTLs
+# ---------------------------------------------------------------------------
+
+_CACHE_TTL_ME = 300.0       # 5 minutes
+_CACHE_TTL_POSTS = 120.0    # 2 minutes
+
+# ---------------------------------------------------------------------------
+# HTTP retry helper
+# ---------------------------------------------------------------------------
+
+_RETRY_STATUSES = frozenset({429, 503})
+_RETRY_BACKOFF = [1.0, 2.0]  # seconds to sleep before attempt 1 and 2
+
+
+def _http_execute(client: httpx.Client, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    """Execute an HTTP method with up to 3 attempts, backing off on 429/503."""
+    last_exc: Optional[httpx.HTTPStatusError] = None
+    for attempt in range(3):
+        r: httpx.Response = getattr(client, method)(url, **kwargs)
+        if r.status_code not in _RETRY_STATUSES:
+            r.raise_for_status()
+            return r
+        last_exc = httpx.HTTPStatusError(
+            f"HTTP {r.status_code}", request=r.request, response=r
+        )
+        if attempt < len(_RETRY_BACKOFF):
+            time.sleep(_RETRY_BACKOFF[attempt])
+    assert last_exc is not None
+    raise last_exc
+
 API_BASE = "https://api.linkedin.com/v2"
+REST_BASE = "https://api.linkedin.com/rest"   # versioned REST API (requires LinkedIn-Version header)
 OPENID_USERINFO = "https://api.linkedin.com/v2/userinfo"
 VOYAGER_BASE = "https://www.linkedin.com/voyager/api"
 
-# LinkedIn requires this header on all v2 REST calls.
-RESTLI_HEADER = {"X-Restli-Protocol-Version": "2.0.0"}
+# LinkedIn requires these headers on all v2 REST calls.
+# LinkedIn-Version pins the API version; without it some finders return NO_VERSION errors.
+# Override via LINKEDIN_API_VERSION env var when LinkedIn rotates the active version set.
+RESTLI_HEADER = {
+    "X-Restli-Protocol-Version": "2.0.0",
+    "LinkedIn-Version": os.environ.get("LINKEDIN_API_VERSION", "202506"),
+}
 
 
 class LinkedInClient:
@@ -40,6 +90,15 @@ class LinkedInClient:
     def __init__(self, access_token: str, timeout: float = 20.0) -> None:
         self._token = access_token
         self._timeout = timeout
+        # Persistent client — reuses TCP connections across calls within the
+        # same LinkedInClient instance (connection pooling).
+        self._http = httpx.Client(timeout=self._timeout, headers=self._headers())
+
+    def __del__(self) -> None:
+        try:
+            self._http.close()
+        except Exception:
+            pass
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -55,30 +114,22 @@ class LinkedInClient:
 
     def _get(self, path: str, params: Optional[dict] = None) -> Any:
         url = path if path.startswith("http") else f"{API_BASE}{path}"
-        with httpx.Client(timeout=self._timeout) as c:
-            r = c.get(url, headers=self._headers(), params=params)
-            r.raise_for_status()
-            return r.json() if r.content else {}
+        r = _http_execute(self._http, "get", url, params=params)
+        return r.json() if r.content else {}
 
     def _post(self, path: str, body: dict) -> Any:
         url = f"{API_BASE}{path}"
-        with httpx.Client(timeout=self._timeout) as c:
-            r = c.post(url, headers=self._headers(), json=body)
-            r.raise_for_status()
-            return r.json() if r.content else {}
+        r = _http_execute(self._http, "post", url, json=body)
+        return r.json() if r.content else {}
 
     def _patch(self, path: str, body: dict) -> Any:
         url = f"{API_BASE}{path}"
-        with httpx.Client(timeout=self._timeout) as c:
-            r = c.patch(url, headers=self._headers(), json=body)
-            r.raise_for_status()
-            return r.json() if r.content else {}
+        r = _http_execute(self._http, "patch", url, json=body)
+        return r.json() if r.content else {}
 
     def _delete(self, path: str) -> None:
         url = f"{API_BASE}{path}"
-        with httpx.Client(timeout=self._timeout) as c:
-            r = c.delete(url, headers=self._headers())
-            r.raise_for_status()
+        _http_execute(self._http, "delete", url)
 
     # ── Profile ────────────────────────────────────────────────────────────────
 
@@ -150,7 +201,10 @@ class LinkedInClient:
         person_urn: Optional[str] = None,
     ) -> list[dict]:
         """
-        Return the authenticated member's recent UGC posts.
+        Return the authenticated member's recent posts via the versioned REST API.
+
+        Uses GET /rest/posts?q=author (LinkedIn versioned API, replacing the
+        deprecated GET /v2/ugcPosts?q=authors).
 
         Args:
             count:      How many to fetch (1–50).
@@ -159,24 +213,28 @@ class LinkedInClient:
         if person_urn is None:
             person_urn = self.get_person_urn()
 
-        encoded = urllib.parse.quote(person_urn, safe="")
         params = {
-            "q": "authors",
-            "authors": f"List({encoded})",
+            "q": "author",
+            "author": person_urn,
             "count": max(1, min(count, 50)),
+            "sortBy": "LAST_MODIFIED",
         }
-        data = self._get("/ugcPosts", params=params)
+        url = f"{REST_BASE}/posts"
+        data = self._get(url, params=params)
         return data.get("elements", [])
 
     def delete_post(self, post_urn: str) -> None:
         """
-        Permanently delete a UGC post.
+        Permanently delete a post (ugcPost or share URN).
 
         Args:
-            post_urn: Full URN, e.g. urn:li:ugcPost:1234567890
+            post_urn: Full URN, e.g. urn:li:ugcPost:123 or urn:li:share:123
         """
         encoded = urllib.parse.quote(post_urn, safe="")
-        self._delete(f"/ugcPosts/{encoded}")
+        if ":share:" in post_urn:
+            _http_execute(self._http, "delete", f"{REST_BASE}/posts/{encoded}")
+        else:
+            self._delete(f"/ugcPosts/{encoded}")
 
     # ── Profile mutations ──────────────────────────────────────────────────────
 
@@ -293,56 +351,92 @@ class VoyagerClient:
         self._jsessionid = jsessionid.strip('"')
         self._user_data_dir = user_data_dir
         self._timeout_ms = int(timeout * 1000)
+        self._cache = SimpleCache()
+        self._playwright: Any = None
+        self._context: Any = None
+        self._page: Any = None
+        self._lock = threading.Lock()
+        # Single dedicated thread so Playwright sync API never runs inside asyncio.
+        self._executor = ThreadPoolExecutor(max_workers=1)
 
-    def _request(self, path: str, method: str = "GET", body: Optional[dict] = None) -> Any:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(self._browser_request, path, method, body).result()
+    _BLOCKED = {"image", "media", "font", "stylesheet", "other"}
 
-    def _browser_request(self, path: str, method: str, body: Optional[dict]) -> Any:
-        from playwright.sync_api import sync_playwright
-
-        if not self._user_data_dir:
-            raise RuntimeError(
-                "No persistent browser profile found. "
-                "Run the `authenticate` tool once to set up the browser session "
-                "needed for Voyager API access."
-            )
-
-        url = f"{VOYAGER_BASE}{path}"
-        jsessionid = self._jsessionid
-
-        _BLOCKED = {"image", "media", "font", "stylesheet", "other"}
-
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
+    def _ensure_context(self) -> None:
+        """Launch the persistent Playwright context on first use; reuse on subsequent calls."""
+        with self._lock:
+            if self._context is not None:
+                return
+            if not self._user_data_dir:
+                raise RuntimeError(
+                    "No persistent browser profile found. "
+                    "Run the `authenticate` tool once to set up the browser session "
+                    "needed for Voyager API access."
+                )
+            self._playwright = _sync_playwright().__enter__()
+            self._context = self._playwright.chromium.launch_persistent_context(
                 self._user_data_dir,
                 headless=True,
                 args=["--disable-blink-features=AutomationControlled"],
             )
+            self._page = self._context.new_page()
+            self._page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in VoyagerClient._BLOCKED
+                else route.continue_(),
+            )
+            atexit.register(self.close)
+
+    def close(self) -> None:
+        """Close the persistent browser context and release Playwright."""
+        with self._lock:
             try:
-                page = context.new_page()
-                page.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if route.request.resource_type in _BLOCKED
-                    else route.continue_(),
-                )
-                page.goto(
-                    "https://www.linkedin.com/feed/",
-                    wait_until="domcontentloaded",
-                    timeout=self._timeout_ms,
-                )
-                live_cookies = context.cookies("https://www.linkedin.com")
-                live_jsessionid = next(
-                    (c["value"].strip('"') for c in live_cookies if c["name"] == "JSESSIONID"),
-                    jsessionid,
-                )
-                result = page.evaluate(
-                    _VOYAGER_FETCH_SCRIPT,
-                    {"url": url, "jsessionid": live_jsessionid, "method": method, "body": body},
-                )
-            finally:
-                context.close()
+                if self._page is not None:
+                    self._page.close()
+            except Exception:
+                pass
+            try:
+                if self._context is not None:
+                    self._context.close()
+            except Exception:
+                pass
+            try:
+                if self._playwright is not None:
+                    self._playwright.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._page = None
+            self._context = None
+            self._playwright = None
+
+    def __del__(self) -> None:
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception:
+            pass
+
+    def _browser_request(self, path: str, method: str, body: Optional[dict]) -> Any:
+        self._ensure_context()
+        url = f"{VOYAGER_BASE}{path}"
+        page = self._page
+
+        # Navigate to feed only if not already on a linkedin.com page.
+        if "linkedin.com" not in page.url:
+            page.goto(
+                "https://www.linkedin.com/feed/",
+                wait_until="domcontentloaded",
+                timeout=self._timeout_ms,
+            )
+
+        live_cookies = self._context.cookies("https://www.linkedin.com")
+        live_jsessionid = next(
+            (c["value"].strip('"') for c in live_cookies if c["name"] == "JSESSIONID"),
+            self._jsessionid,
+        )
+        result = page.evaluate(
+            _VOYAGER_FETCH_SCRIPT,
+            {"url": url, "jsessionid": live_jsessionid, "method": method, "body": body},
+        )
 
         if result["status"] >= 400:
             raise RuntimeError(
@@ -353,10 +447,10 @@ class VoyagerClient:
     def _get(self, path: str, params: Optional[dict] = None) -> Any:
         if params:
             path = f"{path}?{urllib.parse.urlencode(params)}"
-        return self._request(path, "GET")
+        return self._browser_request(path, "GET", None)
 
     def _patch(self, path: str, body: dict) -> Any:
-        return self._request(path, "PATCH", body)
+        return self._browser_request(path, "PATCH", body)
 
     def get_me(self) -> dict:
         """
@@ -365,7 +459,10 @@ class VoyagerClient:
         Returns a normalized dict with keys: headline, first_name, last_name,
         public_id, entity_urn, picture_url.
         """
-        raw = self._get("/me")
+        hit, cached = self._cache.get("get_me", _CACHE_TTL_ME)
+        if hit:
+            return cached
+        raw = self._executor.submit(self._get, "/me").result()
 
         # Voyager /me: miniProfile lives in included[0], data holds only a URN pointer.
         included = raw.get("included", [])
@@ -391,7 +488,7 @@ class VoyagerClient:
             )
             picture_url = root_url + artifacts[-1].get("fileIdentifyingUrlPathSegment", "")
 
-        return {
+        result = {
             "headline": mini.get("occupation", ""),
             "first_name": mini.get("firstName", ""),
             "last_name": mini.get("lastName", ""),
@@ -399,13 +496,16 @@ class VoyagerClient:
             "entity_urn": mini.get("entityUrn", ""),
             "picture_url": picture_url,
         }
+        self._cache.set("get_me", result)
+        return result
 
     def update_headline(self, headline: str, public_id: str) -> dict:
         """Update the profile headline via Voyager."""
-        return self._patch(
+        return self._executor.submit(
+            self._patch,
             f"/identity/profiles/{public_id}",
             {"patch": {"$set": {"headline": headline}}},
-        )
+        ).result()
 
     def get_notifications(self, count: int = 20) -> list[dict]:
         """
@@ -414,18 +514,9 @@ class VoyagerClient:
         LinkedIn renders notification cards server-side; the Voyager REST endpoint
         returns only badge counts, not the cards themselves.
         """
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(self._browser_scrape_notifications, count).result()
+        return self._executor.submit(self._browser_scrape_notifications, count).result()
 
     def _browser_scrape_notifications(self, count: int) -> list[dict]:
-        from playwright.sync_api import sync_playwright
-
-        if not self._user_data_dir:
-            raise RuntimeError(
-                "No persistent browser profile found. Run authenticate first."
-            )
-
-        _BLOCKED = {"image", "media", "font", "stylesheet", "other"}
         _EXTRACT_SCRIPT = """
             () => {
                 const cards = document.querySelectorAll(
@@ -438,31 +529,15 @@ class VoyagerClient:
                 return main.innerText.split('\\n').map(l => l.trim()).filter(Boolean);
             }
         """
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                self._user_data_dir,
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            try:
-                page = context.new_page()
-                page.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if route.request.resource_type in _BLOCKED
-                    else route.continue_(),
-                )
-                page.goto(
-                    "https://www.linkedin.com/notifications/",
-                    wait_until="domcontentloaded",
-                    timeout=self._timeout_ms,
-                )
-                page.evaluate("window.scrollTo(0, 600)")
-                page.wait_for_timeout(2000)
-                items = page.evaluate(_EXTRACT_SCRIPT)
-            finally:
-                context.close()
-
+        self._ensure_context()
+        self._page.goto(
+            "https://www.linkedin.com/notifications/",
+            wait_until="domcontentloaded",
+            timeout=self._timeout_ms,
+        )
+        self._page.evaluate("window.scrollTo(0, 600)")
+        self._page.wait_for_timeout(2000)
+        items = self._page.evaluate(_EXTRACT_SCRIPT)
         return [{"text": t} for t in items[:count]]
 
     def get_conversations(self, entity_urn: str, count: int = 20) -> list[dict]:
@@ -480,13 +555,65 @@ class VoyagerClient:
             f"?queryId=messengerConversations.0d5e6781bbee71c3e51c8843c6519f48"
             f"&variables=(mailboxUrn:{encoded})"
         )
-        raw = self._get(path)
+        raw = self._executor.submit(self._get, path).result()
         included = raw.get("included", [])
         convos = [
             item for item in included
             if item.get("$type") == "com.linkedin.messenger.Conversation"
         ]
         return convos[:count]
+
+    def get_recent_posts(self, public_id: str, count: int = 10) -> list[dict]:
+        """Scrape recent posts from the member's LinkedIn activity page."""
+        cache_key = f"posts:{public_id}:{count}"
+        hit, cached = self._cache.get(cache_key, _CACHE_TTL_POSTS)
+        if hit:
+            return cached
+        result = self._executor.submit(self._browser_scrape_posts, public_id, count).result()
+        self._cache.set(cache_key, result)
+        return result
+
+    def _browser_scrape_posts(self, public_id: str, count: int) -> list[dict]:
+        _EXTRACT_SCRIPT = """
+            () => {
+                const posts = [];
+                // Each activity update card
+                const cards = document.querySelectorAll(
+                    '.feed-shared-update-v2, [data-urn], .occludable-update'
+                );
+                for (const card of cards) {
+                    const urn = card.getAttribute('data-urn') || '';
+                    // Skip non-post URNs (e.g. ads, shares by others)
+                    if (urn && !urn.includes('activity') && !urn.includes('ugcPost') && !urn.includes('share')) continue;
+                    const textEl = card.querySelector(
+                        '.feed-shared-update-v2__description, .break-words, .feed-shared-text'
+                    );
+                    const text = textEl ? textEl.innerText.trim() : '';
+                    const timeEl = card.querySelector('time, .feed-shared-actor__sub-description');
+                    const time = timeEl ? timeEl.getAttribute('datetime') || timeEl.innerText.trim() : '';
+                    if (text) posts.push({ urn, text, time });
+                }
+                // Fallback: if no structured cards found, grab all article text blocks
+                if (!posts.length) {
+                    const items = document.querySelectorAll('article, li[class*="occludable"]');
+                    for (const item of items) {
+                        const t = item.innerText.trim();
+                        if (t.length > 30) posts.push({ urn: '', text: t.slice(0, 500), time: '' });
+                    }
+                }
+                return posts;
+            }
+        """
+        self._ensure_context()
+        self._page.goto(
+            f"https://www.linkedin.com/in/{public_id}/recent-activity/all/",
+            wait_until="domcontentloaded",
+            timeout=self._timeout_ms,
+        )
+        self._page.evaluate("window.scrollTo(0, 800)")
+        self._page.wait_for_timeout(2500)
+        items = self._page.evaluate(_EXTRACT_SCRIPT)
+        return items[:count]
 
     def get_profile_sections(self, public_id: str) -> dict:
         """
@@ -495,19 +622,9 @@ class VoyagerClient:
         Navigates to each detail page within a single persistent browser context
         and extracts the main content text.
         """
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(self._browser_scrape_profile, public_id).result()
+        return self._executor.submit(self._browser_scrape_profile, public_id).result()
 
     def _browser_scrape_profile(self, public_id: str) -> dict:
-        from playwright.sync_api import sync_playwright
-
-        if not self._user_data_dir:
-            raise RuntimeError(
-                "No persistent browser profile found. "
-                "Run the `authenticate` tool once to set up the browser session."
-            )
-
-        _BLOCKED = {"image", "media", "font", "stylesheet", "other"}
         pages = {
             "about": f"/in/{public_id}/",
             "experience": f"/in/{public_id}/details/experience/",
@@ -515,35 +632,18 @@ class VoyagerClient:
             "skills": f"/in/{public_id}/details/skills/",
         }
         sections: dict = {}
-
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                self._user_data_dir,
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
+        self._ensure_context()
+        for section, path in pages.items():
             try:
-                page = context.new_page()
-                page.route(
-                    "**/*",
-                    lambda route: route.abort()
-                    if route.request.resource_type in _BLOCKED
-                    else route.continue_(),
+                self._page.goto(
+                    f"https://www.linkedin.com{path}",
+                    wait_until="domcontentloaded",
+                    timeout=self._timeout_ms,
                 )
-                for section, path in pages.items():
-                    try:
-                        page.goto(
-                            f"https://www.linkedin.com{path}",
-                            wait_until="domcontentloaded",
-                            timeout=self._timeout_ms,
-                        )
-                        page.evaluate("window.scrollTo(0, 600)")
-                        page.wait_for_timeout(1500)
-                        content = page.evaluate(_PAGE_TEXT_SCRIPT)
-                        sections[section] = content[:4000]
-                    except Exception as exc:
-                        sections[section] = f"Error: {exc}"
-            finally:
-                context.close()
-
+                self._page.evaluate("window.scrollTo(0, 600)")
+                self._page.wait_for_timeout(1500)
+                content = self._page.evaluate(_PAGE_TEXT_SCRIPT)
+                sections[section] = content[:4000]
+            except Exception as exc:
+                sections[section] = f"Error: {exc}"
         return sections
