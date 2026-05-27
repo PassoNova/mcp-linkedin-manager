@@ -6,16 +6,18 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cla
 
 ## Features
 
-### Authentication tools
+### Authentication & account tools
 
 | Tool | What it does |
 |---|---|
-| `authenticate` | OAuth 2.0 browser flow — saves token + optionally captures Voyager session |
-| `logout` | Delete the saved OAuth token |
-| `check_auth` | Show token status, capability tier, scopes, keychain status, and server version |
-| `set_web_session` | Store `li_at` + `JSESSIONID` cookies to enable the Voyager tier |
-| `clear_web_session` | Remove stored browser session cookies |
-| `clear_credentials` | Remove app credentials (Client ID + Secret) from the OS keychain |
+| `authenticate` | OAuth 2.0 browser flow for a named alias (e.g. `work`, `personal`) |
+| `logout` | Remove one user's credentials (defaults to active account) |
+| `check_auth` | Show active user's token status, capability tier, scopes, and keychain status |
+| `switch_user` | Set the active LinkedIn account by alias |
+| `list_users` | List all registered aliases with their auth status and tier |
+| `set_web_session` | Manually store `li_at` + `JSESSIONID` cookies for the active account |
+| `clear_web_session` | Remove browser session cookies for the active account |
+| `clear_credentials` | Remove shared app credentials (Client ID + Secret) from the OS keychain |
 
 ### Profile & content tools
 
@@ -40,9 +42,23 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cla
 
 ---
 
+## Multi-account support
+
+The server supports multiple LinkedIn accounts, each identified by a short alias you choose at authenticate time (e.g. `work`, `personal`). App credentials (CLIENT_ID / SECRET) are shared — only user tokens are per-alias.
+
+```
+Authenticate my work account → authenticate("work")
+Authenticate my personal account → authenticate("personal")
+Switch to personal → switch_user("personal")
+See all accounts → list_users
+Log out personal → logout("personal")
+```
+
+One alias is always "active" — all tools (get_profile, create_post, etc.) operate on it implicitly. Use `switch_user` to change it. `check_auth` always shows the active account.
+
 ## Capability tiers
 
-`check_auth` reports one of three tiers:
+Each alias has its own tier:
 
 | Tier | Condition | Available tools |
 |---|---|---|
@@ -162,10 +178,22 @@ Add this to `~/.claude/settings.json`:
 Once connected, tell Claude:
 
 ```
-Authenticate with LinkedIn
+Authenticate my LinkedIn account — use the alias "work"
 ```
 
-Claude calls `authenticate`, which opens your browser to LinkedIn's authorization page. After you approve, the OAuth token is saved and Playwright attempts to capture the Voyager session automatically. If that succeeds, you get the full **VOYAGER** tier immediately.
+Claude calls `authenticate("work")`, opens your browser to LinkedIn's authorization page, and saves the token under the `work` alias. The alias becomes the active account. Playwright captures the Voyager session automatically if available.
+
+To add a second account:
+
+```
+Authenticate my personal LinkedIn account — alias "personal"
+```
+
+Then switch between them:
+
+```
+Switch to my personal account
+```
 
 If the Voyager session was not captured automatically, set it manually:
 
@@ -202,7 +230,7 @@ linkedin-mcp/
 ├── mcp/
 │   ├── server.py        # FastMCP server — all tools
 │   ├── client.py        # LinkedIn REST API v2 + VoyagerClient
-│   ├── auth.py          # OAuth 2.0 flow, keychain-backed token + credential storage
+│   ├── auth.py          # OAuth 2.0 flow, keychain-backed per-user + shared credential storage
 │   ├── cache.py         # Response caching layer
 │   ├── __main__.py      # CLI: `python -m linkedin_mcp setup`
 │   ├── pyproject.toml
@@ -212,7 +240,8 @@ linkedin-mcp/
 │       ├── test_cache.py
 │       ├── test_client_version.py
 │       ├── test_connection_pool.py
-│       ├── test_keyring.py      # covers all three keychain credential classes
+│       ├── test_keyring.py      # keychain tests for all credential classes
+│       ├── test_users.py        # user registry (alias management) tests
 │       ├── test_playwright_pool.py
 │       └── test_retry.py
 └── README.md
@@ -227,8 +256,10 @@ All three credential classes are stored in the OS keychain when `keyring` is ava
 | Credential | Primary storage | Fallback |
 |---|---|---|
 | Client ID + Secret | OS keychain (`linkedin-mcp / credentials`) | env vars / `.env` only |
-| OAuth access token | OS keychain (`linkedin-mcp / oauth_token`) | `~/.linkedin_mcp_token.json` (0600) |
-| `li_at` + `JSESSIONID` | OS keychain (`linkedin-mcp / session`) | `~/.linkedin_mcp_session.json` (0600) |
+| OAuth token (per alias) | OS keychain (`linkedin-mcp / oauth_token:work`) | `~/.linkedin_mcp_token_work.json` (0600) |
+| Voyager session (per alias) | OS keychain (`linkedin-mcp / session:work`) | `~/.linkedin_mcp_session_work.json` (0600) |
+
+The user registry (`~/.linkedin_mcp_users.json`) stores only alias names and the active pointer — it is not sensitive.
 
 - App credentials have **no plaintext file fallback** — if the keychain is unavailable they must come from environment variables.
 - Fallback files are written with mode `0600` (owner-read only).
@@ -252,3 +283,5 @@ All three credential classes are stored in the OS keychain when `keyring` is ava
 | Browser doesn't open during auth | Run `uv run server.py` directly and paste the printed URL manually |
 | Port 8919 in use | Set `LINKEDIN_REDIRECT_PORT=8920` and update the LinkedIn app redirect URL |
 | `tier: BASE` in `check_auth` | Token missing or expired — run `authenticate` |
+| `No active user` error | No alias registered yet — run `authenticate("work")` |
+| `Unknown alias` in `switch_user` | Alias not yet authenticated — run `authenticate` with that alias first |

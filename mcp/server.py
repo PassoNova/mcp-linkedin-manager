@@ -6,9 +6,11 @@ presence through the official LinkedIn REST API v2.
 
 Tools exposed
 ─────────────
-  authenticate          – OAuth 2.0 browser flow; saves token to disk
-  logout                – Delete the saved token
-  check_auth            – Show token status and available scopes
+  authenticate          – OAuth 2.0 browser flow for a named alias (e.g. 'work')
+  logout                – Remove one user's credentials (defaults to active)
+  check_auth            – Show active user's token status and capability tier
+  switch_user           – Set the active LinkedIn account by alias
+  list_users            – List all registered accounts with their auth status
   get_profile           – Name, headline, profile URL, email
   update_headline       – Change your profile headline
   create_post           – Publish a new text post
@@ -49,22 +51,26 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
 from auth import (
-    DEFAULT_BROWSER_DIR,
     DEFAULT_PORT,
-    DEFAULT_SESSION_FILE,
-    DEFAULT_TOKEN_FILE,
+    deregister_alias,
     delete_credentials,
     delete_token,
     delete_web_session,
+    get_active_alias,
     has_browser_profile,
     is_token_expired,
     load_credentials,
     load_token,
+    load_user_registry,
     load_web_session,
+    register_alias,
     run_oauth_flow,
     save_credentials,
     save_token,
     save_web_session,
+    set_active_alias,
+    validate_alias,
+    _browser_dir,
 )
 from client import LinkedInClient, VoyagerClient
 
@@ -116,51 +122,66 @@ def _credentials() -> tuple[str, str]:
     return client_id, client_secret
 
 
-def _get_client() -> LinkedInClient:
-    """Return an authenticated LinkedInClient, raising if not logged in."""
-    token_data = load_token()
+def _active_alias() -> str:
+    """Return the active alias or raise a helpful error."""
+    alias = get_active_alias()
+    if not alias:
+        raise RuntimeError(
+            "No active user. Run `authenticate` with an alias (e.g. 'work') first."
+        )
+    return alias
+
+
+def _get_client(alias: Optional[str] = None) -> LinkedInClient:
+    """Return an authenticated LinkedInClient for alias (defaults to active user)."""
+    alias = alias or _active_alias()
+    token_data = load_token(alias)
     if not token_data:
         raise RuntimeError(
-            "Not authenticated. Run the `authenticate` tool first."
+            f"Not authenticated as '{alias}'. Run `authenticate` with this alias."
         )
     if is_token_expired(token_data):
         raise RuntimeError(
-            "Your LinkedIn access token has expired. "
-            "Run `authenticate` again to refresh it."
+            f"Token for '{alias}' has expired. Run `authenticate` again."
         )
     return LinkedInClient(token_data["access_token"])
 
 
-_voyager_singleton: Optional[VoyagerClient] = None
-_voyager_session_key: Optional[str] = None
+_voyager_singletons: dict[str, VoyagerClient] = {}
+_voyager_session_keys: dict[str, str] = {}
 
 
-def _get_voyager_client() -> Optional[VoyagerClient]:
-    """Return a reusable VoyagerClient, creating one only when the session changes."""
-    global _voyager_singleton, _voyager_session_key
-    session = load_web_session()
+def _get_voyager_client(alias: Optional[str] = None) -> Optional[VoyagerClient]:
+    """Return a reusable VoyagerClient for alias, creating one only when session changes."""
+    alias = alias or _active_alias()
+    session = load_web_session(alias)
     if not session:
         return None
-    # Use li_at as the cache key — changes when the user re-authenticates.
     key = session.get("li_at", "")
-    if _voyager_singleton is None or key != _voyager_session_key:
-        if _voyager_singleton is not None:
-            _voyager_singleton.close()
-        user_data_dir = DEFAULT_BROWSER_DIR if has_browser_profile() else None
-        _voyager_singleton = VoyagerClient(
-            session["li_at"], session["jsessionid"], user_data_dir=user_data_dir
+    if alias not in _voyager_singletons or key != _voyager_session_keys.get(alias):
+        if alias in _voyager_singletons:
+            _voyager_singletons[alias].close()
+        bdir = _browser_dir(alias)
+        udd = bdir if has_browser_profile(bdir) else None
+        _voyager_singletons[alias] = VoyagerClient(
+            session["li_at"], session["jsessionid"], user_data_dir=udd
         )
-        _voyager_session_key = key
-    return _voyager_singleton
+        _voyager_session_keys[alias] = key
+    return _voyager_singletons[alias]
 
 
-def _invalidate_voyager_singleton() -> None:
-    """Call after set_web_session / clear_web_session / logout."""
-    global _voyager_singleton, _voyager_session_key
-    if _voyager_singleton is not None:
-        _voyager_singleton.close()
-    _voyager_singleton = None
-    _voyager_session_key = None
+def _invalidate_voyager(alias: Optional[str] = None) -> None:
+    """Close and evict Voyager singleton(s). Pass alias to target one; None clears all."""
+    if alias is not None:
+        if alias in _voyager_singletons:
+            _voyager_singletons[alias].close()
+            del _voyager_singletons[alias]
+            _voyager_session_keys.pop(alias, None)
+    else:
+        for vc in _voyager_singletons.values():
+            vc.close()
+        _voyager_singletons.clear()
+        _voyager_session_keys.clear()
 
 
 def _format_error(exc: Exception) -> str:
@@ -190,71 +211,82 @@ def _format_error(exc: Exception) -> str:
 # ── Tools ──────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def authenticate() -> str:
+def authenticate(alias: str) -> str:
     """
-    Start the LinkedIn OAuth 2.0 flow.
+    Start the LinkedIn OAuth 2.0 flow for a named account.
 
-    Opens your default browser so you can authorize the app, then waits
-    for the callback on localhost.  Your access token is saved to
-    ~/.linkedin_mcp_token.json (mode 0600) and reused on future calls.
+    Opens your browser to LinkedIn's authorization page, then saves the
+    token and Voyager session under the given alias. Use `switch_user` to
+    change the active account, and `list_users` to see all registered accounts.
 
-    Before calling this tool, make sure LINKEDIN_CLIENT_ID and
-    LINKEDIN_CLIENT_SECRET are set in your environment (or in a .env file
-    next to server.py).
+    Args:
+        alias: Short name for this account (e.g. 'work', 'personal').
+               Allowed characters: letters, digits, hyphens, underscores.
+               Max 32 characters. Re-authenticating an existing alias replaces
+               its tokens.
+
+    Before calling this, app credentials must be available — run
+    `python -m linkedin_mcp setup` or set LINKEDIN_CLIENT_ID / LINKEDIN_CLIENT_SECRET.
     """
     try:
+        validate_alias(alias)
         client_id, client_secret = _credentials()
-        port = DEFAULT_PORT
 
-        token_data, li_at, jsessionid = run_oauth_flow(client_id, client_secret, port=port)
-        save_token(token_data)
+        token_data, li_at, jsessionid = run_oauth_flow(
+            client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
+        )
+        save_token(token_data, alias)
+        register_alias(alias)
+        _invalidate_voyager(alias)
 
         scopes = token_data.get("scope", "unknown")
         expires_in = token_data.get("expires_in", "unknown")
 
-        session_note = ""
         if li_at and jsessionid:
-            save_web_session(li_at, jsessionid)
-            session_note = f"   Web session    : saved to {DEFAULT_SESSION_FILE} (Voyager API enabled)\n"
+            save_web_session(li_at, jsessionid, alias)
+            session_note = "   Web session    : captured automatically (Voyager API enabled)\n"
         else:
             session_note = (
-                "   Web session    : not captured (run `set_web_session` manually to enable\n"
-                "                    full profile read/write via Voyager API)\n"
+                "   Web session    : not captured — run `set_web_session` manually\n"
+                "                    to enable full profile read/write via Voyager API\n"
             )
 
         return (
-            "✅ Successfully authenticated with LinkedIn!\n"
+            f"✅ Authenticated as '{alias}'!\n"
             f"   Scopes granted : {scopes}\n"
             f"   Expires in     : {expires_in} seconds\n"
-            f"   Token saved to : {DEFAULT_TOKEN_FILE}\n"
             f"{session_note}\n"
-            "You can now use `get_profile`, `create_post`, and other tools."
+            f"'{alias}' is now the active account. Use `switch_user` to change accounts."
         )
     except Exception as exc:
         return _format_error(exc)
 
 
 @mcp.tool()
-def logout() -> str:
+def logout(alias: str = "") -> str:
     """
-    Remove the saved LinkedIn access token from disk.
+    Remove a user's credentials and unregister the alias.
 
-    After calling this, you will need to run `authenticate` again before
-    using any other tool.
+    Args:
+        alias: Which account to log out. Leave empty to log out the active account.
     """
-    existed = delete_token()
-    _invalidate_voyager_singleton()
-    if existed:
-        return f"✅ Token deleted from {DEFAULT_TOKEN_FILE}. You are now logged out."
-    return "ℹ️ No token file found — you were already logged out."
+    try:
+        target = alias.strip() or _active_alias()
+        delete_token(target)
+        delete_web_session(target)
+        _invalidate_voyager(target)
+        deregister_alias(target)
+        return f"✅ '{target}' logged out and removed."
+    except Exception as exc:
+        return _format_error(exc)
 
 
 @mcp.tool()
 def check_auth() -> str:
     """
-    Check whether you have a valid LinkedIn access token.
+    Check the active user's authentication status.
 
-    Returns token metadata (scopes, expiry, and capability tier) without
+    Returns token metadata (alias, scopes, expiry, capability tier) without
     making an API call.
 
     Tier values:
@@ -263,36 +295,54 @@ def check_auth() -> str:
       VOYAGER — valid token + browser session, all tools available
     """
     from auth import _HAS_KEYRING
-    token_data = load_token()
+    alias = get_active_alias()
     credentials_in_keychain = load_credentials() is not None
+
+    if not alias:
+        return json.dumps(
+            {
+                "authenticated": False,
+                "active_user": None,
+                "tier": "BASE",
+                "keychain_available": _HAS_KEYRING,
+                "credentials_in_keychain": credentials_in_keychain,
+                "message": "No users registered. Run `authenticate` with an alias.",
+                "server_version": _SERVER_VERSION,
+            },
+            indent=2,
+        )
+
+    token_data = load_token(alias)
 
     if not token_data:
         return json.dumps(
             {
                 "authenticated": False,
+                "active_user": alias,
                 "tier": "BASE",
                 "keychain_available": _HAS_KEYRING,
                 "credentials_in_keychain": credentials_in_keychain,
-                "message": "No token found. Run `authenticate` to log in.",
+                "message": f"No token for '{alias}'. Run `authenticate` again.",
                 "server_version": _SERVER_VERSION,
             },
             indent=2,
         )
 
     obtained_at = token_data.get("_obtained_at", 0)
-    expires_in = token_data.get("expires_in", 0)
+    expires_in_secs = token_data.get("expires_in", 0)
     expired = is_token_expired(token_data)
-    expiry_ts = obtained_at + expires_in if (obtained_at and expires_in) else None
+    expiry_ts = obtained_at + expires_in_secs if (obtained_at and expires_in_secs) else None
 
     if expired:
         tier = "BASE"
-    elif load_web_session():
+    elif load_web_session(alias):
         tier = "VOYAGER"
     else:
         tier = "OAUTH"
 
     return json.dumps(
         {
+            "active_user": alias,
             "authenticated": True,
             "expired": expired,
             "tier": tier,
@@ -465,10 +515,11 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
         me = vc.get_me()
         name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
         headline = me.get("headline", "")
-        save_web_session(li_at, jsessionid)
-        _invalidate_voyager_singleton()
+        active = _active_alias()
+        save_web_session(li_at, jsessionid, active)
+        _invalidate_voyager(active)
         return (
-            f"✅ Web session saved to {DEFAULT_SESSION_FILE}\n"
+            f"✅ Web session saved for '{active}'\n"
             f"   Verified as  : {name}\n"
             f"   Headline     : {headline or '(not set)'}\n\n"
             "get_profile and update_headline will now use the Voyager API automatically."
@@ -489,11 +540,62 @@ def clear_web_session() -> str:
     After clearing, get_profile and update_headline fall back to the OAuth API
     (which cannot read/write the headline without partner-level scopes).
     """
-    existed = delete_web_session()
-    _invalidate_voyager_singleton()
-    if existed:
-        return f"✅ Web session cleared ({DEFAULT_SESSION_FILE} deleted)."
-    return "ℹ️ No web session found — nothing to clear."
+    try:
+        active = _active_alias()
+        existed = delete_web_session(active)
+        _invalidate_voyager(active)
+        if existed:
+            return f"✅ Web session cleared for '{active}'."
+        return f"ℹ️ No web session found for '{active}' — nothing to clear."
+    except Exception as exc:
+        return _format_error(exc)
+
+
+@mcp.tool()
+def switch_user(alias: str) -> str:
+    """
+    Set the active LinkedIn account.
+
+    All subsequent tool calls (get_profile, create_post, etc.) will operate
+    on this account until you switch again.
+
+    Args:
+        alias: The alias to switch to. Must have been registered via authenticate.
+    """
+    try:
+        set_active_alias(alias)
+        return f"✅ Switched to '{alias}'. All tools will now use this account."
+    except Exception as exc:
+        return _format_error(exc)
+
+
+@mcp.tool()
+def list_users() -> str:
+    """
+    List all registered LinkedIn accounts with their authentication status.
+
+    Shows which account is currently active and the capability tier
+    (BASE / OAUTH / VOYAGER) for each.
+    """
+    reg = load_user_registry()
+    active = reg.get("active")
+    users = []
+    for a in reg.get("aliases", []):
+        token = load_token(a)
+        expired = is_token_expired(token) if token else True
+        has_session = load_web_session(a) is not None
+        tier = (
+            "VOYAGER" if (token and not expired and has_session) else
+            "OAUTH" if (token and not expired) else
+            "BASE"
+        )
+        users.append({
+            "alias": a,
+            "active": a == active,
+            "tier": tier,
+            "authenticated": bool(token and not expired),
+        })
+    return json.dumps({"active": active, "users": users}, indent=2)
 
 
 @mcp.tool()

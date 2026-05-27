@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import time
 import urllib.parse
@@ -58,15 +59,34 @@ SCOPES = [
 ]
 
 DEFAULT_PORT = int(os.environ.get("LINKEDIN_REDIRECT_PORT", "8919"))
-DEFAULT_TOKEN_FILE = os.path.expanduser(
-    os.environ.get("LINKEDIN_TOKEN_FILE", "~/.linkedin_mcp_token.json")
-)
-DEFAULT_SESSION_FILE = os.path.expanduser(
-    os.environ.get("LINKEDIN_SESSION_FILE", "~/.linkedin_mcp_session.json")
-)
 DEFAULT_BROWSER_DIR = os.path.expanduser(
     os.environ.get("LINKEDIN_BROWSER_DIR", "~/.linkedin_mcp_browser")
 )
+DEFAULT_USERS_FILE = os.path.expanduser(
+    os.environ.get("LINKEDIN_USERS_FILE", "~/.linkedin_mcp_users.json")
+)
+
+_ALIAS_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
+
+
+def validate_alias(alias: str) -> None:
+    """Raise ValueError if alias contains invalid characters or is too long."""
+    if not _ALIAS_RE.match(alias):
+        raise ValueError(
+            f"Invalid alias {alias!r}. Use 1–32 letters, digits, hyphens, or underscores."
+        )
+
+
+def _token_path(alias: str) -> str:
+    return os.path.expanduser(f"~/.linkedin_mcp_token_{alias}.json")
+
+
+def _session_path(alias: str) -> str:
+    return os.path.expanduser(f"~/.linkedin_mcp_session_{alias}.json")
+
+
+def _browser_dir(alias: str) -> str:
+    return os.path.expanduser(f"~/.linkedin_mcp_browser_{alias}")
 
 
 # ── Local callback server ──────────────────────────────────────────────────────
@@ -200,6 +220,7 @@ def run_oauth_flow(
     client_id: str,
     client_secret: str,
     port: int = DEFAULT_PORT,
+    browser_dir: str = DEFAULT_BROWSER_DIR,
 ) -> tuple[dict, Optional[str], Optional[str]]:
     """
     Full interactive OAuth flow.
@@ -218,7 +239,7 @@ def run_oauth_flow(
     """
     if _PLAYWRIGHT_AVAILABLE:
         try:
-            return _run_oauth_flow_playwright(client_id, client_secret, port)
+            return _run_oauth_flow_playwright(client_id, client_secret, port, browser_dir)
         except Exception as exc:
             # Playwright binary may not be installed yet; degrade gracefully.
             if "executable doesn't exist" in str(exc) or "BrowserType" in str(type(exc).__name__):
@@ -233,12 +254,13 @@ def _run_oauth_flow_playwright(
     client_id: str,
     client_secret: str,
     port: int,
+    browser_dir: str = DEFAULT_BROWSER_DIR,
 ) -> tuple[dict, Optional[str], Optional[str]]:
     """
     OAuth flow driven by a Playwright persistent context.
 
     Using launch_persistent_context stores the full browser fingerprint
-    (cookies, localStorage, canvas seeds, etc.) in DEFAULT_BROWSER_DIR.
+    (cookies, localStorage, canvas seeds, etc.) in browser_dir.
     VoyagerClient reuses this same profile so LinkedIn sees a consistent
     browser identity on every subsequent API call.
     """
@@ -270,9 +292,9 @@ def _run_oauth_flow_playwright(
         route.fulfill(status=200, content_type="text/html", body=_SUCCESS_HTML)
 
     with sync_playwright() as p:
-        os.makedirs(DEFAULT_BROWSER_DIR, exist_ok=True)
+        os.makedirs(browser_dir, exist_ok=True)
         context = p.chromium.launch_persistent_context(
-            DEFAULT_BROWSER_DIR,
+            browser_dir,
             headless=False,
             args=["--disable-blink-features=AutomationControlled"],
         )
@@ -320,31 +342,35 @@ def _run_oauth_flow_browser(client_id: str, client_secret: str, port: int) -> di
     return token_data
 
 
-# ── Token persistence ──────────────────────────────────────────────────────────
+# ── Token persistence (per-user, keyed by alias) ───────────────────────────────
 
-def save_token(token_data: dict, path: str = DEFAULT_TOKEN_FILE) -> None:
-    """Persist token_data to OS keychain, falling back to path (mode 0o600)."""
+def save_token(token_data: dict, alias: str) -> None:
+    """Persist token_data to OS keychain under alias, falling back to a per-alias file."""
+    key = f"{_KR_KEY_TOKEN}:{alias}"
     if _HAS_KEYRING:
         try:
-            keyring.set_password(_KR_SERVICE, _KR_KEY_TOKEN, json.dumps(token_data))
+            keyring.set_password(_KR_SERVICE, key, json.dumps(token_data))
             return
         except Exception:
             pass
+    path = _token_path(alias)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as fh:
         json.dump(token_data, fh, indent=2)
     os.chmod(path, 0o600)
 
 
-def load_token(path: str = DEFAULT_TOKEN_FILE) -> Optional[dict]:
-    """Load saved token, checking OS keychain first then file."""
+def load_token(alias: str) -> Optional[dict]:
+    """Load saved token for alias, checking OS keychain first then file."""
+    key = f"{_KR_KEY_TOKEN}:{alias}"
     if _HAS_KEYRING:
         try:
-            raw = keyring.get_password(_KR_SERVICE, _KR_KEY_TOKEN)
+            raw = keyring.get_password(_KR_SERVICE, key)
             if raw:
                 return json.loads(raw)
         except Exception:
             pass
+    path = _token_path(alias)
     if not os.path.exists(path):
         return None
     with open(path) as fh:
@@ -364,66 +390,70 @@ def is_token_expired(token_data: dict, buffer_seconds: int = 300) -> bool:
     return time.time() >= (obtained_at + expires_in - buffer_seconds)
 
 
-def delete_token(path: str = DEFAULT_TOKEN_FILE) -> bool:
-    """Remove saved token from keychain and/or file. Returns True if anything was deleted."""
+def delete_token(alias: str) -> bool:
+    """Remove saved token for alias from keychain and/or file. Returns True if anything deleted."""
+    key = f"{_KR_KEY_TOKEN}:{alias}"
     deleted = False
     if _HAS_KEYRING:
         try:
-            keyring.delete_password(_KR_SERVICE, _KR_KEY_TOKEN)
+            keyring.delete_password(_KR_SERVICE, key)
             deleted = True
         except Exception:
             pass
+    path = _token_path(alias)
     if os.path.exists(path):
         os.remove(path)
         deleted = True
     return deleted
 
 
-# ── Web session persistence (Voyager cookies) ──────────────────────────────────
+# ── Web session persistence (Voyager cookies, per-user) ───────────────────────
 
-def save_web_session(
-    li_at: str,
-    jsessionid: str,
-    path: str = DEFAULT_SESSION_FILE,
-) -> None:
-    """Persist li_at and JSESSIONID cookies, preferring OS keychain over plaintext file."""
+def save_web_session(li_at: str, jsessionid: str, alias: str) -> None:
+    """Persist li_at and JSESSIONID cookies for alias, preferring OS keychain."""
+    key = f"{_KR_KEY}:{alias}"
     data = {"li_at": li_at, "jsessionid": jsessionid, "_saved_at": int(time.time())}
     if _HAS_KEYRING:
         try:
-            keyring.set_password(_KR_SERVICE, _KR_KEY, json.dumps(data))
+            keyring.set_password(_KR_SERVICE, key, json.dumps(data))
             return
         except Exception:
             pass
+    path = _session_path(alias)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as fh:
         json.dump(data, fh, indent=2)
     os.chmod(path, 0o600)
 
 
-def load_web_session(path: str = DEFAULT_SESSION_FILE) -> Optional[dict]:
-    """Load saved web session cookies, checking keychain first then file."""
+def load_web_session(alias: str) -> Optional[dict]:
+    """Load saved web session cookies for alias, checking keychain first then file."""
+    key = f"{_KR_KEY}:{alias}"
     if _HAS_KEYRING:
         try:
-            raw = keyring.get_password(_KR_SERVICE, _KR_KEY)
+            raw = keyring.get_password(_KR_SERVICE, key)
             if raw:
                 return json.loads(raw)
         except Exception:
             pass
+    path = _session_path(alias)
     if not os.path.exists(path):
         return None
     with open(path) as fh:
         return json.load(fh)
 
 
-def delete_web_session(path: str = DEFAULT_SESSION_FILE) -> bool:
-    """Remove saved web session from keychain and/or file. Returns True if anything was deleted."""
+def delete_web_session(alias: str) -> bool:
+    """Remove saved web session for alias from keychain and/or file. Returns True if deleted."""
+    key = f"{_KR_KEY}:{alias}"
     deleted = False
     if _HAS_KEYRING:
         try:
-            keyring.delete_password(_KR_SERVICE, _KR_KEY)
+            keyring.delete_password(_KR_SERVICE, key)
             deleted = True
         except Exception:
             pass
+    path = _session_path(alias)
     if os.path.exists(path):
         os.remove(path)
         deleted = True
@@ -464,3 +494,50 @@ def delete_credentials() -> bool:
         return True
     except Exception:
         return False
+
+
+# ── User registry ──────────────────────────────────────────────────────────────
+
+def load_user_registry(path: str = DEFAULT_USERS_FILE) -> dict:
+    """Return {"active": str|None, "aliases": list[str]}."""
+    if not os.path.exists(path):
+        return {"active": None, "aliases": []}
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def save_user_registry(registry: dict, path: str = DEFAULT_USERS_FILE) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(registry, fh, indent=2)
+
+
+def get_active_alias(path: str = DEFAULT_USERS_FILE) -> Optional[str]:
+    return load_user_registry(path).get("active")
+
+
+def set_active_alias(alias: str, path: str = DEFAULT_USERS_FILE) -> None:
+    reg = load_user_registry(path)
+    if alias not in reg["aliases"]:
+        raise ValueError(f"Unknown alias {alias!r}. Run `authenticate` with this alias first.")
+    reg["active"] = alias
+    save_user_registry(reg, path)
+
+
+def register_alias(alias: str, path: str = DEFAULT_USERS_FILE) -> None:
+    """Add alias to registry. Sets it as active if it's the first, or already active."""
+    reg = load_user_registry(path)
+    if alias not in reg["aliases"]:
+        reg["aliases"].append(alias)
+    if reg["active"] is None:
+        reg["active"] = alias
+    save_user_registry(reg, path)
+
+
+def deregister_alias(alias: str, path: str = DEFAULT_USERS_FILE) -> None:
+    """Remove alias from registry; if it was active, promote another alias or set None."""
+    reg = load_user_registry(path)
+    reg["aliases"] = [a for a in reg["aliases"] if a != alias]
+    if reg.get("active") == alias:
+        reg["active"] = reg["aliases"][0] if reg["aliases"] else None
+    save_user_registry(reg, path)

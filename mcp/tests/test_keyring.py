@@ -30,23 +30,20 @@ def _reload_auth_with_keyring(enabled: bool):
 # ---------------------------------------------------------------------------
 
 class TestSaveWebSession:
-    def test_saves_to_keyring_when_available(self, tmp_path, monkeypatch):
+    def test_saves_to_keyring_with_alias_key(self, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", True)
         mock_kr = MagicMock()
         monkeypatch.setattr(auth, "keyring", mock_kr)
 
-        session_file = str(tmp_path / "session.json")
-        auth.save_web_session("li_at_val", "jsess_val", path=session_file)
+        auth.save_web_session("li_at_val", "jsess_val", "work")
 
         mock_kr.set_password.assert_called_once()
         args = mock_kr.set_password.call_args[0]
         assert args[0] == "linkedin-mcp"
-        assert args[1] == "session"
+        assert args[1] == "session:work"
         saved = json.loads(args[2])
         assert saved["li_at"] == "li_at_val"
-        # File must NOT be written when keyring succeeds
-        assert not os.path.exists(session_file)
 
     def test_falls_back_to_file_on_keyring_error(self, tmp_path, monkeypatch):
         import auth
@@ -54,23 +51,25 @@ class TestSaveWebSession:
         mock_kr = MagicMock()
         mock_kr.set_password.side_effect = Exception("keyring unavailable")
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"session_{alias}.json"))
 
-        session_file = str(tmp_path / "session.json")
-        auth.save_web_session("li_at_val", "jsess_val", path=session_file)
+        auth.save_web_session("li_at_val", "jsess_val", "work")
 
-        assert os.path.exists(session_file)
-        data = json.loads(open(session_file).read())
+        path = tmp_path / "session_work.json"
+        assert path.exists()
+        data = json.loads(path.read_text())
         assert data["li_at"] == "li_at_val"
 
     def test_writes_file_when_keyring_unavailable(self, tmp_path, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", False)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"session_{alias}.json"))
 
-        session_file = str(tmp_path / "session.json")
-        auth.save_web_session("token123", "jsess123", path=session_file)
+        auth.save_web_session("token123", "jsess123", "personal")
 
-        assert os.path.exists(session_file)
-        data = json.loads(open(session_file).read())
+        path = tmp_path / "session_personal.json"
+        assert path.exists()
+        data = json.loads(path.read_text())
         assert data["li_at"] == "token123"
 
 
@@ -79,7 +78,7 @@ class TestSaveWebSession:
 # ---------------------------------------------------------------------------
 
 class TestLoadWebSession:
-    def test_loads_from_keyring_first(self, tmp_path, monkeypatch):
+    def test_loads_from_keyring_with_alias_key(self, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", True)
         mock_kr = MagicMock()
@@ -87,21 +86,22 @@ class TestLoadWebSession:
         mock_kr.get_password.return_value = payload
         monkeypatch.setattr(auth, "keyring", mock_kr)
 
-        result = auth.load_web_session(path=str(tmp_path / "session.json"))
+        result = auth.load_web_session("work")
         assert result["li_at"] == "from_kr"
+        mock_kr.get_password.assert_called_once_with("linkedin-mcp", "session:work")
 
-    def test_migration_file_exists_keyring_empty(self, tmp_path, monkeypatch):
-        """If keyring returns None, falls back to file."""
+    def test_falls_back_to_file_when_keyring_empty(self, tmp_path, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", True)
         mock_kr = MagicMock()
         mock_kr.get_password.return_value = None
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"session_{alias}.json"))
 
-        session_file = tmp_path / "session.json"
-        session_file.write_text(json.dumps({"li_at": "from_file", "jsessionid": "j", "_saved_at": 0}))
-
-        result = auth.load_web_session(path=str(session_file))
+        (tmp_path / "session_work.json").write_text(
+            json.dumps({"li_at": "from_file", "jsessionid": "j", "_saved_at": 0})
+        )
+        result = auth.load_web_session("work")
         assert result["li_at"] == "from_file"
 
     def test_returns_none_when_both_missing(self, tmp_path, monkeypatch):
@@ -110,18 +110,20 @@ class TestLoadWebSession:
         mock_kr = MagicMock()
         mock_kr.get_password.return_value = None
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"no_{alias}.json"))
 
-        result = auth.load_web_session(path=str(tmp_path / "nonexistent.json"))
+        result = auth.load_web_session("work")
         assert result is None
 
     def test_loads_from_file_when_keyring_unavailable(self, tmp_path, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", False)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"session_{alias}.json"))
 
-        session_file = tmp_path / "session.json"
-        session_file.write_text(json.dumps({"li_at": "file_token", "jsessionid": "j", "_saved_at": 0}))
-
-        result = auth.load_web_session(path=str(session_file))
+        (tmp_path / "session_personal.json").write_text(
+            json.dumps({"li_at": "file_token", "jsessionid": "j", "_saved_at": 0})
+        )
+        result = auth.load_web_session("personal")
         assert result["li_at"] == "file_token"
 
     def test_falls_back_to_file_on_keyring_exception(self, tmp_path, monkeypatch):
@@ -130,11 +132,12 @@ class TestLoadWebSession:
         mock_kr = MagicMock()
         mock_kr.get_password.side_effect = Exception("keyring error")
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"session_{alias}.json"))
 
-        session_file = tmp_path / "session.json"
-        session_file.write_text(json.dumps({"li_at": "fallback", "jsessionid": "j", "_saved_at": 0}))
-
-        result = auth.load_web_session(path=str(session_file))
+        (tmp_path / "session_work.json").write_text(
+            json.dumps({"li_at": "fallback", "jsessionid": "j", "_saved_at": 0})
+        )
+        result = auth.load_web_session("work")
         assert result["li_at"] == "fallback"
 
 
@@ -143,31 +146,29 @@ class TestLoadWebSession:
 # ---------------------------------------------------------------------------
 
 class TestDeleteWebSession:
-    def test_clears_both_keyring_and_file(self, tmp_path, monkeypatch):
+    def test_clears_keyring_with_alias_key_and_file(self, tmp_path, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", True)
         mock_kr = MagicMock()
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"session_{alias}.json"))
 
-        session_file = tmp_path / "session.json"
-        session_file.write_text("{}")
+        (tmp_path / "session_work.json").write_text("{}")
+        result = auth.delete_web_session("work")
 
-        result = auth.delete_web_session(path=str(session_file))
-
-        mock_kr.delete_password.assert_called_once_with("linkedin-mcp", "session")
-        assert not session_file.exists()
+        mock_kr.delete_password.assert_called_once_with("linkedin-mcp", "session:work")
+        assert not (tmp_path / "session_work.json").exists()
         assert result is True
 
     def test_returns_true_when_only_file_exists(self, tmp_path, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", False)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"session_{alias}.json"))
 
-        session_file = tmp_path / "session.json"
-        session_file.write_text("{}")
-
-        result = auth.delete_web_session(path=str(session_file))
+        (tmp_path / "session_work.json").write_text("{}")
+        result = auth.delete_web_session("work")
         assert result is True
-        assert not session_file.exists()
+        assert not (tmp_path / "session_work.json").exists()
 
     def test_returns_false_when_nothing_exists(self, tmp_path, monkeypatch):
         import auth
@@ -175,8 +176,9 @@ class TestDeleteWebSession:
         mock_kr = MagicMock()
         mock_kr.delete_password.side_effect = Exception("not found")
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"no_{alias}.json"))
 
-        result = auth.delete_web_session(path=str(tmp_path / "nonexistent.json"))
+        result = auth.delete_web_session("work")
         assert result is False
 
     def test_keyring_exception_still_removes_file(self, tmp_path, monkeypatch):
@@ -185,12 +187,11 @@ class TestDeleteWebSession:
         mock_kr = MagicMock()
         mock_kr.delete_password.side_effect = Exception("keyring error")
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"session_{alias}.json"))
 
-        session_file = tmp_path / "session.json"
-        session_file.write_text("{}")
-
-        result = auth.delete_web_session(path=str(session_file))
-        assert not session_file.exists()
+        (tmp_path / "session_work.json").write_text("{}")
+        result = auth.delete_web_session("work")
+        assert not (tmp_path / "session_work.json").exists()
         assert result is True
 
 
@@ -199,23 +200,19 @@ class TestDeleteWebSession:
 # ---------------------------------------------------------------------------
 
 class TestSaveToken:
-    def test_saves_to_keyring_when_available(self, tmp_path, monkeypatch):
+    def test_saves_to_keyring_with_alias_key(self, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", True)
         mock_kr = MagicMock()
         monkeypatch.setattr(auth, "keyring", mock_kr)
 
-        token_file = str(tmp_path / "token.json")
-        token = {"access_token": "tok", "expires_in": 5183944}
-        auth.save_token(token, path=token_file)
+        auth.save_token({"access_token": "tok", "expires_in": 5183944}, "work")
 
         mock_kr.set_password.assert_called_once()
         args = mock_kr.set_password.call_args[0]
         assert args[0] == "linkedin-mcp"
-        assert args[1] == "oauth_token"
-        saved = json.loads(args[2])
-        assert saved["access_token"] == "tok"
-        assert not os.path.exists(token_file)
+        assert args[1] == "oauth_token:work"
+        assert json.loads(args[2])["access_token"] == "tok"
 
     def test_falls_back_to_file_on_keyring_error(self, tmp_path, monkeypatch):
         import auth
@@ -223,24 +220,24 @@ class TestSaveToken:
         mock_kr = MagicMock()
         mock_kr.set_password.side_effect = Exception("backend locked")
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / f"token_{alias}.json"))
 
-        token_file = str(tmp_path / "token.json")
-        auth.save_token({"access_token": "tok"}, path=token_file)
+        auth.save_token({"access_token": "tok"}, "work")
 
-        assert os.path.exists(token_file)
-        data = json.loads(open(token_file).read())
-        assert data["access_token"] == "tok"
+        path = tmp_path / "token_work.json"
+        assert path.exists()
+        assert json.loads(path.read_text())["access_token"] == "tok"
 
     def test_writes_file_when_keyring_unavailable(self, tmp_path, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", False)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / f"token_{alias}.json"))
 
-        token_file = str(tmp_path / "token.json")
-        auth.save_token({"access_token": "tok"}, path=token_file)
+        auth.save_token({"access_token": "tok"}, "personal")
 
-        assert os.path.exists(token_file)
-        data = json.loads(open(token_file).read())
-        assert data["access_token"] == "tok"
+        path = tmp_path / "token_personal.json"
+        assert path.exists()
+        assert json.loads(path.read_text())["access_token"] == "tok"
 
 
 # ---------------------------------------------------------------------------
@@ -248,28 +245,27 @@ class TestSaveToken:
 # ---------------------------------------------------------------------------
 
 class TestLoadToken:
-    def test_loads_from_keyring_first(self, tmp_path, monkeypatch):
+    def test_loads_from_keyring_with_alias_key(self, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", True)
         mock_kr = MagicMock()
-        payload = json.dumps({"access_token": "from_kr"})
-        mock_kr.get_password.return_value = payload
+        mock_kr.get_password.return_value = json.dumps({"access_token": "from_kr"})
         monkeypatch.setattr(auth, "keyring", mock_kr)
 
-        result = auth.load_token(path=str(tmp_path / "token.json"))
+        result = auth.load_token("work")
         assert result["access_token"] == "from_kr"
+        mock_kr.get_password.assert_called_once_with("linkedin-mcp", "oauth_token:work")
 
-    def test_migration_file_exists_keyring_empty(self, tmp_path, monkeypatch):
+    def test_falls_back_to_file_when_keyring_empty(self, tmp_path, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", True)
         mock_kr = MagicMock()
         mock_kr.get_password.return_value = None
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / f"token_{alias}.json"))
 
-        token_file = tmp_path / "token.json"
-        token_file.write_text(json.dumps({"access_token": "from_file"}))
-
-        result = auth.load_token(path=str(token_file))
+        (tmp_path / "token_work.json").write_text(json.dumps({"access_token": "from_file"}))
+        result = auth.load_token("work")
         assert result["access_token"] == "from_file"
 
     def test_falls_back_to_file_on_keyring_exception(self, tmp_path, monkeypatch):
@@ -278,11 +274,10 @@ class TestLoadToken:
         mock_kr = MagicMock()
         mock_kr.get_password.side_effect = Exception("keyring error")
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / f"token_{alias}.json"))
 
-        token_file = tmp_path / "token.json"
-        token_file.write_text(json.dumps({"access_token": "fallback"}))
-
-        result = auth.load_token(path=str(token_file))
+        (tmp_path / "token_work.json").write_text(json.dumps({"access_token": "fallback"}))
+        result = auth.load_token("work")
         assert result["access_token"] == "fallback"
 
     def test_returns_none_when_both_missing(self, tmp_path, monkeypatch):
@@ -291,8 +286,9 @@ class TestLoadToken:
         mock_kr = MagicMock()
         mock_kr.get_password.return_value = None
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / f"no_{alias}.json"))
 
-        result = auth.load_token(path=str(tmp_path / "nonexistent.json"))
+        result = auth.load_token("work")
         assert result is None
 
 
@@ -301,31 +297,29 @@ class TestLoadToken:
 # ---------------------------------------------------------------------------
 
 class TestDeleteToken:
-    def test_deletes_both_keyring_and_file(self, tmp_path, monkeypatch):
+    def test_deletes_keyring_with_alias_key_and_file(self, tmp_path, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", True)
         mock_kr = MagicMock()
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / f"token_{alias}.json"))
 
-        token_file = tmp_path / "token.json"
-        token_file.write_text("{}")
+        (tmp_path / "token_work.json").write_text("{}")
+        result = auth.delete_token("work")
 
-        result = auth.delete_token(path=str(token_file))
-
-        mock_kr.delete_password.assert_called_once_with("linkedin-mcp", "oauth_token")
-        assert not token_file.exists()
+        mock_kr.delete_password.assert_called_once_with("linkedin-mcp", "oauth_token:work")
+        assert not (tmp_path / "token_work.json").exists()
         assert result is True
 
     def test_returns_true_when_only_file_exists(self, tmp_path, monkeypatch):
         import auth
         monkeypatch.setattr(auth, "_HAS_KEYRING", False)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / f"token_{alias}.json"))
 
-        token_file = tmp_path / "token.json"
-        token_file.write_text("{}")
-
-        result = auth.delete_token(path=str(token_file))
+        (tmp_path / "token_work.json").write_text("{}")
+        result = auth.delete_token("work")
         assert result is True
-        assert not token_file.exists()
+        assert not (tmp_path / "token_work.json").exists()
 
     def test_returns_false_when_nothing_exists(self, tmp_path, monkeypatch):
         import auth
@@ -333,8 +327,9 @@ class TestDeleteToken:
         mock_kr = MagicMock()
         mock_kr.delete_password.side_effect = Exception("not found")
         monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / f"no_{alias}.json"))
 
-        result = auth.delete_token(path=str(tmp_path / "nonexistent.json"))
+        result = auth.delete_token("work")
         assert result is False
 
 
