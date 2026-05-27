@@ -38,6 +38,7 @@ jobs:
 
       - name: Build linkedin-mcp.plugin
         run: |
+          cp README.md mcp/README.md
           zip -r linkedin-mcp.plugin \
             mcp/auth.py \
             mcp/client.py \
@@ -46,6 +47,7 @@ jobs:
             mcp/linkedin_mcp/ \
             mcp/pyproject.toml \
             mcp/uv.lock \
+            mcp/README.md \
             skills/ \
             .claude-plugin/ \
             .mcp.json \
