@@ -36,6 +36,12 @@ try:
 except ImportError:
     _HAS_KEYRING = False
 
+try:
+    import browser_cookie3
+    _HAS_BROWSER_COOKIE3 = True
+except ImportError:
+    _HAS_BROWSER_COOKIE3 = False
+
 _KR_SERVICE = "linkedin-mcp"
 _KR_KEY = "session"
 _KR_KEY_TOKEN = "oauth_token"
@@ -216,6 +222,19 @@ def has_browser_profile(path: str = DEFAULT_BROWSER_DIR) -> bool:
     return os.path.exists(path) and bool(os.listdir(path))
 
 
+def _capture_chrome_linkedin_cookies() -> tuple[Optional[str], Optional[str]]:
+    """Read li_at and JSESSIONID from the system Chrome cookie store after OAuth."""
+    if not _HAS_BROWSER_COOKIE3:
+        return None, None
+    try:
+        cj = browser_cookie3.chrome(domain_name=".linkedin.com")
+        li_at = next((c.value for c in cj if c.name == "li_at"), None)
+        jsessionid = next((c.value for c in cj if c.name == "JSESSIONID"), None)
+        return li_at, jsessionid
+    except Exception:
+        return None, None
+
+
 def _is_playwright_network_or_binary_error(exc: Exception) -> bool:
     exc_str = str(exc)
     return (
@@ -261,7 +280,9 @@ async def run_oauth_flow(
                     continue  # try next option
                 raise
     token_data = _run_oauth_flow_browser(client_id, client_secret, port)
-    return token_data, None, None
+    # Playwright couldn't control the browser — read cookies from Chrome's store instead.
+    li_at, jsessionid = _capture_chrome_linkedin_cookies()
+    return token_data, li_at, jsessionid
 
 
 async def _run_oauth_flow_playwright(
