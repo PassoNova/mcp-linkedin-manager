@@ -211,7 +211,7 @@ def _format_error(exc: Exception) -> str:
 # ── Tools ──────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def authenticate(alias: str) -> str:
+async def authenticate(alias: str) -> str:
     """
     Start the LinkedIn OAuth 2.0 flow for a named account.
 
@@ -232,7 +232,7 @@ def authenticate(alias: str) -> str:
         validate_alias(alias)
         client_id, client_secret = _credentials()
 
-        token_data, li_at, jsessionid = run_oauth_flow(
+        token_data, li_at, jsessionid = await run_oauth_flow(
             client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
         )
         save_token(token_data, alias)
@@ -894,7 +894,8 @@ def get_api_capabilities() -> str:
     Call this before attempting profile-write or community operations to
     understand which features are available without partner-program access.
     """
-    token_data = load_token()
+    alias = get_active_alias()
+    token_data = load_token(alias) if alias else None
     scopes = token_data.get("scope", "unknown") if token_data else "not authenticated"
 
     capabilities = {
