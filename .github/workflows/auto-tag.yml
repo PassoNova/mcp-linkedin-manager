@@ -1,8 +1,8 @@
-name: Auto Tag
+name: Auto Release
 
-# Fires on every merge to main. Reads the latest semver tag, bumps the patch
-# number, and pushes a new tag — which chains into release.yml to build and
-# publish a GitHub Release.
+# Fires on every merge to main: bumps the patch tag, runs tests, builds
+# linkedin-mcp.plugin, and publishes a GitHub Release — all in one job chain
+# to avoid GITHUB_TOKEN cross-workflow dispatch restrictions.
 on:
   push:
     branches: [main]
@@ -12,23 +12,21 @@ permissions:
 
 jobs:
   tag:
-    # Skip version-bump commits pushed by this workflow itself (shouldn't
-    # produce tags since we only push a tag, but guard anyway).
-    if: "!startsWith(github.event.head_commit.message, 'chore: bump version')"
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
 
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # need full tag history
+          fetch-depth: 0
 
       - name: Compute next patch tag
         id: next
         run: |
           LATEST=$(git tag --sort=-version:refname | grep '^v[0-9]' | head -1)
           if [ -z "$LATEST" ]; then
-            LATEST="v0.1.0"
-            echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+            echo "tag=v0.1.0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           VERSION=${LATEST#v}
@@ -42,12 +40,59 @@ jobs:
           git tag "${{ steps.next.outputs.tag }}"
           git push origin "${{ steps.next.outputs.tag }}"
 
-      # GITHUB_TOKEN-pushed tags don't trigger other workflows (GitHub sandbox
-      # limitation), so we explicitly dispatch the release workflow on the new tag.
-      - name: Trigger release
+  test:
+    needs: tag
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        working-directory: mcp
+        run: uv sync --group dev
+
+      - name: Run tests
+        working-directory: mcp
+        run: uv run pytest tests/ --ignore=tests/test_playwright_pool.py -v
+
+  build-and-release:
+    needs: [tag, test]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build linkedin-mcp.plugin
         run: |
-          gh workflow run release.yml \
-            --repo "${{ github.repository }}" \
-            --ref "${{ steps.next.outputs.tag }}"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          zip -r linkedin-mcp.plugin \
+            mcp/auth.py \
+            mcp/client.py \
+            mcp/server.py \
+            mcp/cache.py \
+            mcp/linkedin_mcp/ \
+            mcp/pyproject.toml \
+            mcp/uv.lock \
+            skills/ \
+            .claude-plugin/ \
+            .mcp.json \
+            .env.example \
+            README.md
+
+      - name: Upload plugin artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linkedin-mcp-plugin
+          path: linkedin-mcp.plugin
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.tag.outputs.tag }}
+          files: linkedin-mcp.plugin
+          generate_release_notes: true
