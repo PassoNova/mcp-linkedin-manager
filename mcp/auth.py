@@ -216,6 +216,20 @@ def has_browser_profile(path: str = DEFAULT_BROWSER_DIR) -> bool:
     return os.path.exists(path) and bool(os.listdir(path))
 
 
+def _is_playwright_network_or_binary_error(exc: Exception) -> bool:
+    exc_str = str(exc)
+    return (
+        "executable doesn't exist" in exc_str
+        or "not found" in exc_str.lower()
+        or "no such file" in exc_str.lower()
+        or "BrowserType" in type(exc).__name__
+        or "ERR_CONNECTION_REFUSED" in exc_str
+        or "ERR_NAME_NOT_RESOLVED" in exc_str
+        or "ERR_INTERNET_DISCONNECTED" in exc_str
+        or "net::" in exc_str
+    )
+
+
 async def run_oauth_flow(
     client_id: str,
     client_secret: str,
@@ -227,33 +241,24 @@ async def run_oauth_flow(
 
     Returns (token_data, li_at, jsessionid).
 
-    When Playwright is installed, a managed Chromium window handles the entire
-    flow — the OAuth callback is intercepted directly and LinkedIn session
-    cookies (li_at, JSESSIONID) are harvested automatically, enabling Voyager
-    API access with no manual DevTools work.
-
-    When Playwright is unavailable, falls back to webbrowser.open() + a local
-    callback server; li_at and jsessionid are returned as None.
+    Tries browsers in order, stopping at the first success:
+      1. System Chrome via Playwright (channel="chrome") — already trusted by
+         macOS firewall; harvests li_at + JSESSIONID for Voyager API.
+      2. Playwright bundled Chromium — fallback when Chrome isn't installed.
+      3. webbrowser.open() + local HTTP server — last resort; no cookie capture
+         so li_at and jsessionid are returned as None.
 
     Raises RuntimeError on failure or timeout.
     """
     if _PLAYWRIGHT_AVAILABLE:
-        try:
-            return await _run_oauth_flow_playwright(client_id, client_secret, port, browser_dir)
-        except Exception as exc:
-            exc_str = str(exc)
-            # Fall back to system browser when the Playwright binary is missing or
-            # when Chromium can't reach the network (e.g. blocked by macOS firewall).
-            if (
-                "executable doesn't exist" in exc_str
-                or "BrowserType" in type(exc).__name__
-                or "ERR_CONNECTION_REFUSED" in exc_str
-                or "ERR_NAME_NOT_RESOLVED" in exc_str
-                or "ERR_INTERNET_DISCONNECTED" in exc_str
-                or "net::" in exc_str
-            ):
-                pass  # fall through to legacy flow
-            else:
+        for channel in ("chrome", None):
+            try:
+                return await _run_oauth_flow_playwright(
+                    client_id, client_secret, port, browser_dir, channel=channel
+                )
+            except Exception as exc:
+                if _is_playwright_network_or_binary_error(exc):
+                    continue  # try next option
                 raise
     token_data = _run_oauth_flow_browser(client_id, client_secret, port)
     return token_data, None, None
@@ -264,6 +269,7 @@ async def _run_oauth_flow_playwright(
     client_secret: str,
     port: int,
     browser_dir: str = DEFAULT_BROWSER_DIR,
+    channel: Optional[str] = None,
 ) -> tuple[dict, Optional[str], Optional[str]]:
     """
     OAuth flow driven by a Playwright persistent context.
@@ -302,11 +308,13 @@ async def _run_oauth_flow_playwright(
 
     async with async_playwright() as p:
         os.makedirs(browser_dir, exist_ok=True)
-        context = await p.chromium.launch_persistent_context(
-            browser_dir,
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        launch_kwargs: dict = {
+            "headless": False,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        if channel:
+            launch_kwargs["channel"] = channel
+        context = await p.chromium.launch_persistent_context(browser_dir, **launch_kwargs)
         page = await context.new_page()
 
         # Intercept the OAuth callback — no local HTTP server needed.
