@@ -251,13 +251,14 @@ def _capture_chrome_linkedin_cookies() -> tuple[Optional[str], Optional[str], Op
 
 
 def _is_playwright_binary_error(exc: Exception) -> bool:
-    """Return True when Playwright binary is missing or not installed."""
+    """Return True when Playwright can't launch or network-connect the browser."""
     exc_str = str(exc)
     return (
         "executable doesn't exist" in exc_str
         or "no such file" in exc_str.lower()
         or "BrowserType" in type(exc).__name__
-        or "run `playwright install`" in exc_str
+        or "ERR_CONNECTION_REFUSED" in exc_str
+        or "net::" in exc_str
     )
 
 
