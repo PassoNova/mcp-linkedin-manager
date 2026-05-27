@@ -27,11 +27,13 @@ from typing import Any, Optional
 import httpx
 
 API_BASE = "https://api.linkedin.com/v2"
+REST_BASE = "https://api.linkedin.com/rest"   # versioned REST API (requires LinkedIn-Version header)
 OPENID_USERINFO = "https://api.linkedin.com/v2/userinfo"
 VOYAGER_BASE = "https://www.linkedin.com/voyager/api"
 
-# LinkedIn requires this header on all v2 REST calls.
-RESTLI_HEADER = {"X-Restli-Protocol-Version": "2.0.0"}
+# LinkedIn requires these headers on all v2 REST calls.
+# LinkedIn-Version pins the API version; without it some finders return NO_VERSION errors.
+RESTLI_HEADER = {"X-Restli-Protocol-Version": "2.0.0", "LinkedIn-Version": "202401"}
 
 
 class LinkedInClient:
@@ -150,7 +152,10 @@ class LinkedInClient:
         person_urn: Optional[str] = None,
     ) -> list[dict]:
         """
-        Return the authenticated member's recent UGC posts.
+        Return the authenticated member's recent posts via the versioned REST API.
+
+        Uses GET /rest/posts?q=author (LinkedIn versioned API, replacing the
+        deprecated GET /v2/ugcPosts?q=authors).
 
         Args:
             count:      How many to fetch (1–50).
@@ -159,24 +164,33 @@ class LinkedInClient:
         if person_urn is None:
             person_urn = self.get_person_urn()
 
-        encoded = urllib.parse.quote(person_urn, safe="")
         params = {
-            "q": "authors",
-            "authors": f"List({encoded})",
+            "q": "author",
+            "author": person_urn,
             "count": max(1, min(count, 50)),
+            "sortBy": "LAST_MODIFIED",
         }
-        data = self._get("/ugcPosts", params=params)
+        url = f"{REST_BASE}/posts"
+        data = self._get(url, params=params)
         return data.get("elements", [])
 
     def delete_post(self, post_urn: str) -> None:
         """
-        Permanently delete a UGC post.
+        Permanently delete a post (ugcPost or share URN).
 
         Args:
-            post_urn: Full URN, e.g. urn:li:ugcPost:1234567890
+            post_urn: Full URN, e.g. urn:li:ugcPost:123 or urn:li:share:123
         """
         encoded = urllib.parse.quote(post_urn, safe="")
-        self._delete(f"/ugcPosts/{encoded}")
+        if ":share:" in post_urn:
+            with httpx.Client(timeout=self._timeout) as c:
+                r = c.delete(
+                    f"{REST_BASE}/posts/{encoded}",
+                    headers=self._headers(),
+                )
+                r.raise_for_status()
+        else:
+            self._delete(f"/ugcPosts/{encoded}")
 
     # ── Profile mutations ──────────────────────────────────────────────────────
 
@@ -487,6 +501,78 @@ class VoyagerClient:
             if item.get("$type") == "com.linkedin.messenger.Conversation"
         ]
         return convos[:count]
+
+    def get_recent_posts(self, public_id: str, count: int = 10) -> list[dict]:
+        """Scrape recent posts from the member's LinkedIn activity page."""
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(self._browser_scrape_posts, public_id, count).result()
+
+    def _browser_scrape_posts(self, public_id: str, count: int) -> list[dict]:
+        from playwright.sync_api import sync_playwright
+
+        if not self._user_data_dir:
+            raise RuntimeError(
+                "No persistent browser profile found. Run authenticate first."
+            )
+
+        _BLOCKED = {"image", "media", "font", "stylesheet", "other"}
+        _EXTRACT_SCRIPT = """
+            () => {
+                const posts = [];
+                // Each activity update card
+                const cards = document.querySelectorAll(
+                    '.feed-shared-update-v2, [data-urn], .occludable-update'
+                );
+                for (const card of cards) {
+                    const urn = card.getAttribute('data-urn') || '';
+                    // Skip non-post URNs (e.g. ads, shares by others)
+                    if (urn && !urn.includes('activity') && !urn.includes('ugcPost') && !urn.includes('share')) continue;
+                    const textEl = card.querySelector(
+                        '.feed-shared-update-v2__description, .break-words, .feed-shared-text'
+                    );
+                    const text = textEl ? textEl.innerText.trim() : '';
+                    const timeEl = card.querySelector('time, .feed-shared-actor__sub-description');
+                    const time = timeEl ? timeEl.getAttribute('datetime') || timeEl.innerText.trim() : '';
+                    if (text) posts.push({ urn, text, time });
+                }
+                // Fallback: if no structured cards found, grab all article text blocks
+                if (!posts.length) {
+                    const items = document.querySelectorAll('article, li[class*="occludable"]');
+                    for (const item of items) {
+                        const t = item.innerText.trim();
+                        if (t.length > 30) posts.push({ urn: '', text: t.slice(0, 500), time: '' });
+                    }
+                }
+                return posts;
+            }
+        """
+
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                self._user_data_dir,
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                page = context.new_page()
+                page.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in _BLOCKED
+                    else route.continue_(),
+                )
+                page.goto(
+                    f"https://www.linkedin.com/in/{public_id}/recent-activity/all/",
+                    wait_until="domcontentloaded",
+                    timeout=self._timeout_ms,
+                )
+                page.evaluate("window.scrollTo(0, 800)")
+                page.wait_for_timeout(2500)
+                items = page.evaluate(_EXTRACT_SCRIPT)
+            finally:
+                context.close()
+
+        return items[:count]
 
     def get_profile_sections(self, public_id: str) -> dict:
         """
