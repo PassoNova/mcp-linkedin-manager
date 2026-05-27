@@ -122,13 +122,36 @@ def _get_client() -> LinkedInClient:
     return LinkedInClient(token_data["access_token"])
 
 
+_voyager_singleton: Optional[VoyagerClient] = None
+_voyager_session_key: Optional[str] = None
+
+
 def _get_voyager_client() -> Optional[VoyagerClient]:
-    """Return a VoyagerClient backed by the persistent browser profile, or None."""
+    """Return a reusable VoyagerClient, creating one only when the session changes."""
+    global _voyager_singleton, _voyager_session_key
     session = load_web_session()
     if not session:
         return None
-    user_data_dir = DEFAULT_BROWSER_DIR if has_browser_profile() else None
-    return VoyagerClient(session["li_at"], session["jsessionid"], user_data_dir=user_data_dir)
+    # Use li_at as the cache key — changes when the user re-authenticates.
+    key = session.get("li_at", "")
+    if _voyager_singleton is None or key != _voyager_session_key:
+        if _voyager_singleton is not None:
+            _voyager_singleton.close()
+        user_data_dir = DEFAULT_BROWSER_DIR if has_browser_profile() else None
+        _voyager_singleton = VoyagerClient(
+            session["li_at"], session["jsessionid"], user_data_dir=user_data_dir
+        )
+        _voyager_session_key = key
+    return _voyager_singleton
+
+
+def _invalidate_voyager_singleton() -> None:
+    """Call after set_web_session / clear_web_session / logout."""
+    global _voyager_singleton, _voyager_session_key
+    if _voyager_singleton is not None:
+        _voyager_singleton.close()
+    _voyager_singleton = None
+    _voyager_session_key = None
 
 
 def _format_error(exc: Exception) -> str:
@@ -211,6 +234,7 @@ def logout() -> str:
     using any other tool.
     """
     existed = delete_token()
+    _invalidate_voyager_singleton()
     if existed:
         return f"✅ Token deleted from {DEFAULT_TOKEN_FILE}. You are now logged out."
     return "ℹ️ No token file found — you were already logged out."
@@ -428,6 +452,7 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
         name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
         headline = me.get("headline", "")
         save_web_session(li_at, jsessionid)
+        _invalidate_voyager_singleton()
         return (
             f"✅ Web session saved to {DEFAULT_SESSION_FILE}\n"
             f"   Verified as  : {name}\n"
@@ -451,6 +476,7 @@ def clear_web_session() -> str:
     (which cannot read/write the headline without partner-level scopes).
     """
     existed = delete_web_session()
+    _invalidate_voyager_singleton()
     if existed:
         return f"✅ Web session cleared ({DEFAULT_SESSION_FILE} deleted)."
     return "ℹ️ No web session found — nothing to clear."

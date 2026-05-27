@@ -25,6 +25,7 @@ import os
 import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import httpx
@@ -355,6 +356,8 @@ class VoyagerClient:
         self._context: Any = None
         self._page: Any = None
         self._lock = threading.Lock()
+        # Single dedicated thread so Playwright sync API never runs inside asyncio.
+        self._executor = ThreadPoolExecutor(max_workers=1)
 
     _BLOCKED = {"image", "media", "font", "stylesheet", "other"}
 
@@ -406,6 +409,12 @@ class VoyagerClient:
             self._context = None
             self._playwright = None
 
+    def __del__(self) -> None:
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception:
+            pass
+
     def _browser_request(self, path: str, method: str, body: Optional[dict]) -> Any:
         self._ensure_context()
         url = f"{VOYAGER_BASE}{path}"
@@ -453,7 +462,7 @@ class VoyagerClient:
         hit, cached = self._cache.get("get_me", _CACHE_TTL_ME)
         if hit:
             return cached
-        raw = self._get("/me")
+        raw = self._executor.submit(self._get, "/me").result()
 
         # Voyager /me: miniProfile lives in included[0], data holds only a URN pointer.
         included = raw.get("included", [])
@@ -492,10 +501,11 @@ class VoyagerClient:
 
     def update_headline(self, headline: str, public_id: str) -> dict:
         """Update the profile headline via Voyager."""
-        return self._patch(
+        return self._executor.submit(
+            self._patch,
             f"/identity/profiles/{public_id}",
             {"patch": {"$set": {"headline": headline}}},
-        )
+        ).result()
 
     def get_notifications(self, count: int = 20) -> list[dict]:
         """
@@ -504,7 +514,7 @@ class VoyagerClient:
         LinkedIn renders notification cards server-side; the Voyager REST endpoint
         returns only badge counts, not the cards themselves.
         """
-        return self._browser_scrape_notifications(count)
+        return self._executor.submit(self._browser_scrape_notifications, count).result()
 
     def _browser_scrape_notifications(self, count: int) -> list[dict]:
         _EXTRACT_SCRIPT = """
@@ -545,7 +555,7 @@ class VoyagerClient:
             f"?queryId=messengerConversations.0d5e6781bbee71c3e51c8843c6519f48"
             f"&variables=(mailboxUrn:{encoded})"
         )
-        raw = self._get(path)
+        raw = self._executor.submit(self._get, path).result()
         included = raw.get("included", [])
         convos = [
             item for item in included
@@ -559,7 +569,7 @@ class VoyagerClient:
         hit, cached = self._cache.get(cache_key, _CACHE_TTL_POSTS)
         if hit:
             return cached
-        result = self._browser_scrape_posts(public_id, count)
+        result = self._executor.submit(self._browser_scrape_posts, public_id, count).result()
         self._cache.set(cache_key, result)
         return result
 
@@ -612,7 +622,7 @@ class VoyagerClient:
         Navigates to each detail page within a single persistent browser context
         and extracts the main content text.
         """
-        return self._browser_scrape_profile(public_id)
+        return self._executor.submit(self._browser_scrape_profile, public_id).result()
 
     def _browser_scrape_profile(self, public_id: str) -> dict:
         pages = {
