@@ -41,3 +41,13 @@ jobs:
         run: |
           git tag "${{ steps.next.outputs.tag }}"
           git push origin "${{ steps.next.outputs.tag }}"
+
+      # GITHUB_TOKEN-pushed tags don't trigger other workflows (GitHub sandbox
+      # limitation), so we explicitly dispatch the release workflow on the new tag.
+      - name: Trigger release
+        run: |
+          gh workflow run release.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ steps.next.outputs.tag }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
