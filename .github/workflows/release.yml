@@ -43,7 +43,7 @@ jobs:
             mcp/client.py \
             mcp/server.py \
             mcp/cache.py \
-            mcp/__main__.py \
+            mcp/linkedin_mcp/ \
             mcp/pyproject.toml \
             mcp/uv.lock \
             skills/ \
