@@ -5,15 +5,16 @@ LinkedIn MCP and what is available to the user right now.
 
 ## Step 1 — Query live state
 
-Call these two tools in parallel:
-- `check_auth` — returns authentication status and the active capability tier
+Call these three tools in parallel:
+- `check_auth` — returns the active user, authentication status, and capability tier
 - `get_api_capabilities` — returns which tools are available in the current tier
+- `list_users` — returns all registered aliases and their individual tiers
 
 ## Step 2 — Interpret the tier
 
 Use the `tier` field from `check_auth` to determine what's unlocked:
 
-### BASE tier (no credentials configured)
+### BASE tier (no users registered)
 Nothing is available yet. The user needs to complete first-time setup.
 
 Tell the user:
@@ -29,9 +30,7 @@ Route to: `linkedin-setup` skill.
 Core profile and posts features are available.
 
 Tell the user:
-> "LinkedIn is connected via OAuth. Here's what's available right now:"
-
-Present a capability summary using the `get_api_capabilities` response:
+> "LinkedIn is connected as **[active_user]** via OAuth. Here's what's available right now:"
 
 | Capability | Status |
 |---|---|
@@ -54,7 +53,7 @@ Then explain how to unlock more:
 Full capabilities unlocked.
 
 Tell the user:
-> "LinkedIn is fully connected. All capabilities are active:"
+> "LinkedIn is fully connected as **[active_user]**. All capabilities are active:"
 
 | Capability | Status |
 |---|---|
@@ -76,6 +75,17 @@ After presenting the status, offer the most relevant next step based on tier:
   with LinkedIn to unlock full profile and messaging."
 - **VOYAGER**: Offer "Get my LinkedIn profile", "Show my notifications",
   "Get my conversations", or "Post to LinkedIn."
+
+## Multi-account summary (when list_users has more than one entry)
+
+Present a compact table:
+
+| Alias | Active | Tier |
+|---|---|---|
+| work | ✅ | VOYAGER |
+| personal | — | OAUTH |
+
+Offer: "Say 'Switch to personal' to change the active account."
 
 ## Note on token expiry
 

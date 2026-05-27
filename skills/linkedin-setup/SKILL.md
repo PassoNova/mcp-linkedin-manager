@@ -27,34 +27,54 @@ Tell the user to:
    `http://localhost:8919/callback`
 5. Copy **Client ID** and **Client Secret**
 
-## Step 3 — Save credentials
+## Step 3 — Save credentials to the OS keychain
+
+Run this command in the terminal — it prompts for credentials interactively
+(Client Secret is hidden, never echoed):
 
 ```bash
-cat > ~/.linkedin_mcp.env << 'EOF'
-LINKEDIN_CLIENT_ID=PASTE_CLIENT_ID_HERE
-LINKEDIN_CLIENT_SECRET=PASTE_CLIENT_SECRET_HERE
-EOF
-chmod 600 ~/.linkedin_mcp.env
+cd /path/to/linkedin-mcp/mcp
+uv run python -m linkedin_mcp setup
 ```
 
-## Step 4 — Restart Claude
+Credentials are stored in the OS keychain (macOS Keychain / Windows Credential
+Manager / Linux Secret Service). No `.env` file is created or needed.
 
-Fully quit Claude (⌘Q) and reopen so the plugin picks up the credentials.
+If the OS keychain is unavailable, fall back to a `.env` file:
 
-## Step 5 — Authenticate
+```bash
+cp .env.example .env
+# Edit .env with LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET
+```
 
-Tell the user to say: **"Authenticate with LinkedIn"**
+On first `authenticate`, the `.env` credentials are auto-migrated to the keychain.
 
-## Step 6 — Verify
+## Step 4 — Authenticate
 
-Call `check_auth` then `get_profile`. If both return data, setup is complete.
+Ask the user for a short alias for this account (e.g. `work` or `personal`),
+then tell them to say:
+
+> **"Authenticate with LinkedIn using the alias 'work'"**
+
+Claude will call `authenticate("work")`, open the browser to LinkedIn's
+authorization page, and — after approval — save the token under the `work` alias.
+Browser session cookies are captured automatically, unlocking the Voyager tier.
+
+## Step 5 — Verify
+
+Call `check_auth` (look for `active_user` and `tier`), then `get_profile`.
+If both return data, setup is complete.
+
+To add more accounts later, repeat Step 4 with a different alias (e.g. `personal`),
+then use `switch_user` to move between them.
 
 ## Troubleshooting
 
 | Error | Cause | Fix |
 |---|---|---|
-| "credentials are not configured" | `~/.linkedin_mcp.env` missing | Re-check Step 3, restart Claude |
+| "LinkedIn app credentials not found" | Keychain empty and no `.env` | Re-run `python -m linkedin_mcp setup` |
 | "The requested permission scope is not valid" | LinkedIn Products not added | Add both Products in Step 2 |
 | "Bummer, something went wrong" | Redirect URL mismatch | Verify `http://localhost:8919/callback` in Auth tab |
-| "401 Unauthorized" | Token expired | Run `authenticate` again |
+| "401 Unauthorized" | Token expired | Run `authenticate` again with the same alias |
+| "Invalid alias" | Alias contains spaces or special characters | Use only letters, digits, hyphens, underscores |
 | Port 8919 in use | Another process on the port | `lsof -i :8919` then kill it |

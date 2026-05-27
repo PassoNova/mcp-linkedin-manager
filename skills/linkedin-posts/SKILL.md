@@ -7,6 +7,9 @@ description: >
   something for LinkedIn".
 ---
 
+All post operations run on the **active account**. Use `switch_user(alias)`
+to change accounts or `list_users` to see which account is currently active.
+
 ## Creating a post
 
 1. **Draft first** — if the user has rough ideas, help craft a polished post:

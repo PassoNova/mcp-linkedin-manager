@@ -1,5 +1,8 @@
 # LinkedIn MCP — Posts Operations
 
+All post operations run on the **active account** (set via `switch_user`).
+Use `list_users` to see which alias is currently active.
+
 ## Creating a post
 
 When the user wants to publish something:

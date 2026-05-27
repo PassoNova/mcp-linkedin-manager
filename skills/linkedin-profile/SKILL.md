@@ -6,6 +6,9 @@ description: >
   LinkedIn bio", "my LinkedIn info", or "what does my LinkedIn profile say".
 ---
 
+All profile operations run on the **active account**. Use `switch_user(alias)`
+to change accounts or `list_users` to see which account is currently active.
+
 ## Viewing profile
 
 Call `get_profile` and present: **Name** and **Headline** prominently, Email and
