@@ -5,14 +5,10 @@
       "args": [
         "run",
         "--directory",
-        "/Users/sergiocarrerorodriguez/ai/mcp/servers/linkedin-mcp/mcp",
+        "mcp",
         "python",
         "server.py"
-      ],
-      "env": {
-        "LINKEDIN_CLIENT_ID": "${LINKEDIN_CLIENT_ID}",
-        "LINKEDIN_CLIENT_SECRET": "${LINKEDIN_CLIENT_SECRET}"
-      }
+      ]
     }
   }
 }

@@ -28,7 +28,6 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cla
 | `update_headline` | Change your profile headline |
 | `create_post` | Publish a PUBLIC or CONNECTIONS-only text post (up to 3,000 chars) |
 | `get_posts` | List your recent posts (up to 50) — falls back to Voyager automatically |
-| `get_recent_activity` | List recent posts via browser session (no partner scope needed) |
 | `delete_post` | Remove a post by URN |
 
 ### Social & inbox tools
@@ -143,33 +142,31 @@ You should see the MCP server start. Press Ctrl+C to stop.
 
 ## Connect to Claude
 
+Credentials are read from the OS keychain — no environment variables needed in the Claude configuration once you have run `python -m linkedin_mcp setup`.
+
 ### Claude Code (CLI)
 
 ```bash
 claude mcp add linkedin-manager \
-  -e LINKEDIN_CLIENT_ID=your_client_id \
-  -e LINKEDIN_CLIENT_SECRET=your_client_secret \
-  -- python /full/path/to/linkedin-mcp/mcp/server.py
+  -- uv run --directory /full/path/to/linkedin-mcp/mcp python server.py
 ```
 
 ### Claude Desktop / settings.json
 
-Add this to `~/.claude/settings.json`:
+Add this block to `~/.claude/settings.json` (or the equivalent config file for your platform):
 
 ```json
 {
   "mcpServers": {
     "linkedin-manager": {
-      "command": "python",
-      "args": ["/full/path/to/linkedin-mcp/mcp/server.py"],
-      "env": {
-        "LINKEDIN_CLIENT_ID": "your_client_id",
-        "LINKEDIN_CLIENT_SECRET": "your_client_secret"
-      }
+      "command": "uv",
+      "args": ["run", "--directory", "/full/path/to/linkedin-mcp/mcp", "python", "server.py"]
     }
   }
 }
 ```
+
+> **Note:** If the OS keychain is unavailable on your system, add `"env": {"LINKEDIN_CLIENT_ID": "...", "LINKEDIN_CLIENT_SECRET": "..."}` to the block above as a fallback.
 
 ---
 
@@ -222,17 +219,59 @@ Post to LinkedIn: "Excited to share that I've been working on an AI-powered Link
 
 ---
 
+## CI and plugin releases
+
+Two GitHub Actions workflows are included:
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| `ci.yml` | Push to `main` / `feat/**`, any PR | Runs the full test suite (excluding Playwright pool tests) |
+| `release.yml` | `v*` tag push or manual dispatch | Runs tests, then builds and publishes `linkedin-mcp.plugin` as a GitHub release asset |
+
+### Publishing a new version
+
+```bash
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+GitHub Actions runs the tests, then attaches `linkedin-mcp.plugin` to a new release automatically.
+
+### Downloading the plugin
+
+Download `linkedin-mcp.plugin` from the [Releases page](https://github.com/PassoNova/mcp-linkedin-manager/releases/latest) and install it via the Claude desktop app or Claude Code plugin manager. The plugin includes the server code, all skill guides, and the MCP configuration.
+
+### Building the plugin locally
+
+```bash
+zip -r linkedin-mcp.plugin \
+  mcp/auth.py mcp/client.py mcp/server.py mcp/cache.py mcp/__main__.py \
+  mcp/pyproject.toml mcp/uv.lock \
+  skills/ .claude-plugin/ .mcp.json .env.example README.md
+```
+
+The `.plugin` file is a ZIP archive — it is not tracked in this repository. The `release.yml` workflow is the canonical way to produce it.
+
+---
+
 ## File structure
 
 ```
 linkedin-mcp/
-├── .env.example         # Credential template (keychain preferred over this file)
+├── .github/
+│   └── workflows/
+│       ├── ci.yml           # Test runner — push / PR
+│       └── release.yml      # Plugin builder + GitHub release — v* tags
+├── .claude-plugin/
+│   └── plugin.json          # Claude plugin manifest
+├── .mcp.json                # MCP server configuration (relative paths — for plugin use)
+├── .env.example             # Credential template (keychain preferred over this file)
 ├── mcp/
-│   ├── server.py        # FastMCP server — all tools
-│   ├── client.py        # LinkedIn REST API v2 + VoyagerClient
-│   ├── auth.py          # OAuth 2.0 flow, keychain-backed per-user + shared credential storage
-│   ├── cache.py         # Response caching layer
-│   ├── __main__.py      # CLI: `python -m linkedin_mcp setup`
+│   ├── server.py            # FastMCP server — all tools
+│   ├── client.py            # LinkedIn REST API v2 + VoyagerClient
+│   ├── auth.py              # OAuth 2.0 flow, keychain-backed per-user + shared credential storage
+│   ├── cache.py             # Response caching layer
+│   ├── __main__.py          # CLI: `python -m linkedin_mcp setup`
 │   ├── pyproject.toml
 │   ├── uv.lock
 │   └── tests/
@@ -240,10 +279,16 @@ linkedin-mcp/
 │       ├── test_cache.py
 │       ├── test_client_version.py
 │       ├── test_connection_pool.py
-│       ├── test_keyring.py      # keychain tests for all credential classes
-│       ├── test_users.py        # user registry (alias management) tests
+│       ├── test_keyring.py          # Keychain tests for all credential classes
+│       ├── test_users.py            # User registry (alias management) tests
 │       ├── test_playwright_pool.py
 │       └── test_retry.py
+├── skills/                          # Claude skill guides (loaded automatically)
+│   ├── linkedin-authenticate/
+│   ├── linkedin-discover/
+│   ├── linkedin-posts/
+│   ├── linkedin-profile/
+│   └── linkedin-setup/
 └── README.md
 ```
 
