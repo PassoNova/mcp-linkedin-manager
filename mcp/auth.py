@@ -279,10 +279,13 @@ async def run_oauth_flow(
                 if _is_playwright_network_or_binary_error(exc):
                     continue  # try next option
                 raise
-    token_data = _run_oauth_flow_browser(client_id, client_secret, port)
-    # Playwright couldn't control the browser — read cookies from Chrome's store instead.
-    li_at, jsessionid = _capture_chrome_linkedin_cookies()
-    return token_data, li_at, jsessionid
+    token_data, opened_via_chrome = _run_oauth_flow_browser(client_id, client_secret, port)
+    if opened_via_chrome:
+        # Give Chrome a moment to flush the session cookies to its SQLite store.
+        time.sleep(3)
+        li_at, jsessionid = _capture_chrome_linkedin_cookies()
+        return token_data, li_at, jsessionid
+    return token_data, None, None
 
 
 async def _run_oauth_flow_playwright(
@@ -361,13 +364,37 @@ async def _run_oauth_flow_playwright(
     return token_data, li_at, jsessionid
 
 
-def _run_oauth_flow_browser(client_id: str, client_secret: str, port: int) -> dict:
-    """Legacy OAuth flow using webbrowser.open() + local callback server."""
+def _open_in_chrome(url: str) -> bool:
+    """Open *url* in Google Chrome directly. Returns True if Chrome was found."""
+    import subprocess
+    # macOS: 'open -a' forces the URL to open in Chrome regardless of default browser.
+    try:
+        result = subprocess.run(
+            ["open", "-a", "Google Chrome", url],
+            check=True, capture_output=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def _run_oauth_flow_browser(client_id: str, client_secret: str, port: int) -> tuple[dict, bool]:
+    """
+    OAuth flow using a local callback server.
+
+    Returns (token_data, opened_via_chrome).
+
+    Prefers opening Chrome explicitly (so browser-cookie3 can capture li_at
+    afterwards) and falls back to webbrowser.open() when Chrome isn't available.
+    """
     redirect_uri = f"http://localhost:{port}/callback"
     state = secrets.token_urlsafe(16)
     auth_url = build_auth_url(client_id, redirect_uri, state)
 
-    webbrowser.open(auth_url)
+    opened_via_chrome = _open_in_chrome(auth_url)
+    if not opened_via_chrome:
+        webbrowser.open(auth_url)
+
     code, error = _wait_for_code(port, expected_state=state)
 
     if error:
@@ -377,7 +404,7 @@ def _run_oauth_flow_browser(client_id: str, client_secret: str, port: int) -> di
 
     token_data = exchange_code(code, client_id, client_secret, redirect_uri)
     token_data["_obtained_at"] = int(time.time())
-    return token_data
+    return token_data, opened_via_chrome
 
 
 # ── Token persistence (per-user, keyed by alias) ───────────────────────────────
