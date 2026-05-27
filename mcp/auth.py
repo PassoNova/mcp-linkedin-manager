@@ -24,7 +24,7 @@ from typing import Optional
 import httpx
 
 try:
-    from playwright.sync_api import sync_playwright, Route as PlaywrightRoute
+    from playwright.async_api import async_playwright, Route as PlaywrightRoute
     _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
@@ -216,7 +216,7 @@ def has_browser_profile(path: str = DEFAULT_BROWSER_DIR) -> bool:
     return os.path.exists(path) and bool(os.listdir(path))
 
 
-def run_oauth_flow(
+async def run_oauth_flow(
     client_id: str,
     client_secret: str,
     port: int = DEFAULT_PORT,
@@ -239,10 +239,19 @@ def run_oauth_flow(
     """
     if _PLAYWRIGHT_AVAILABLE:
         try:
-            return _run_oauth_flow_playwright(client_id, client_secret, port, browser_dir)
+            return await _run_oauth_flow_playwright(client_id, client_secret, port, browser_dir)
         except Exception as exc:
-            # Playwright binary may not be installed yet; degrade gracefully.
-            if "executable doesn't exist" in str(exc) or "BrowserType" in str(type(exc).__name__):
+            exc_str = str(exc)
+            # Fall back to system browser when the Playwright binary is missing or
+            # when Chromium can't reach the network (e.g. blocked by macOS firewall).
+            if (
+                "executable doesn't exist" in exc_str
+                or "BrowserType" in type(exc).__name__
+                or "ERR_CONNECTION_REFUSED" in exc_str
+                or "ERR_NAME_NOT_RESOLVED" in exc_str
+                or "ERR_INTERNET_DISCONNECTED" in exc_str
+                or "net::" in exc_str
+            ):
                 pass  # fall through to legacy flow
             else:
                 raise
@@ -250,7 +259,7 @@ def run_oauth_flow(
     return token_data, None, None
 
 
-def _run_oauth_flow_playwright(
+async def _run_oauth_flow_playwright(
     client_id: str,
     client_secret: str,
     port: int,
@@ -277,11 +286,11 @@ def _run_oauth_flow_playwright(
         "</body></html>"
     )
 
-    def _handle_callback(route: "PlaywrightRoute") -> None:
+    async def _handle_callback(route: "PlaywrightRoute") -> None:
         params = urllib.parse.parse_qs(urllib.parse.urlparse(route.request.url).query)
         received_state = params.get("state", [None])[0]
         if received_state != state:
-            route.fulfill(
+            await route.fulfill(
                 status=400,
                 content_type="text/html",
                 body="<html><body>State mismatch — possible CSRF attempt.</body></html>",
@@ -289,34 +298,34 @@ def _run_oauth_flow_playwright(
             captured_code[0] = None
             return
         captured_code[0] = params.get("code", [None])[0]
-        route.fulfill(status=200, content_type="text/html", body=_SUCCESS_HTML)
+        await route.fulfill(status=200, content_type="text/html", body=_SUCCESS_HTML)
 
-    with sync_playwright() as p:
+    async with async_playwright() as p:
         os.makedirs(browser_dir, exist_ok=True)
-        context = p.chromium.launch_persistent_context(
+        context = await p.chromium.launch_persistent_context(
             browser_dir,
             headless=False,
             args=["--disable-blink-features=AutomationControlled"],
         )
-        page = context.new_page()
+        page = await context.new_page()
 
         # Intercept the OAuth callback — no local HTTP server needed.
-        page.route(f"http://localhost:{port}/callback**", _handle_callback)
+        await page.route(f"http://localhost:{port}/callback**", _handle_callback)
 
-        page.goto(auth_url)
+        await page.goto(auth_url)
         # Block until LinkedIn redirects back to our callback URL (user must log in + approve).
-        page.wait_for_url(f"http://localhost:{port}/callback**", timeout=120_000)
+        await page.wait_for_url(f"http://localhost:{port}/callback**", timeout=120_000)
 
         if not captured_code[0]:
-            context.close()
+            await context.close()
             raise RuntimeError("No authorization code received from LinkedIn.")
 
         # Harvest LinkedIn session cookies before closing the browser.
-        raw_cookies = context.cookies("https://www.linkedin.com")
+        raw_cookies = await context.cookies("https://www.linkedin.com")
         li_at = next((c["value"] for c in raw_cookies if c["name"] == "li_at"), None)
         jsessionid = next((c["value"] for c in raw_cookies if c["name"] == "JSESSIONID"), None)
 
-        context.close()
+        await context.close()
 
     token_data = exchange_code(captured_code[0], client_id, client_secret, redirect_uri)
     token_data["_obtained_at"] = int(time.time())
