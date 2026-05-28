@@ -104,6 +104,184 @@ def _browser_dir(alias: str) -> str:
     return os.path.expanduser(f"~/.linkedin_mcp_browser_{alias}")
 
 
+# ── OAuth callback pages ───────────────────────────────────────────────────────
+
+_SUCCESS_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LinkedIn connected</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #f3f4f6;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.08);
+    max-width: 480px;
+    width: 100%;
+    padding: 48px 40px 40px;
+    text-align: center;
+  }
+  .icon { font-size: 48px; margin-bottom: 16px; }
+  h1 { font-size: 22px; font-weight: 700; color: #111; margin-bottom: 8px; }
+  .subtitle { font-size: 14px; color: #6b7280; margin-bottom: 32px; line-height: 1.5; }
+  .keep-open {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #fef9c3;
+    color: #854d0e;
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    margin-bottom: 36px;
+  }
+  .features {
+    text-align: left;
+    border-top: 1px solid #f0f0f0;
+    padding-top: 28px;
+  }
+  .features-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: #9ca3af;
+    margin-bottom: 16px;
+  }
+  .feature {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 10px 0;
+    border-bottom: 1px solid #f9f9f9;
+  }
+  .feature:last-child { border-bottom: none; }
+  .feature-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: #f3f4f6;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+    flex-shrink: 0;
+  }
+  .feature-text strong {
+    display: block;
+    font-size: 13px;
+    font-weight: 600;
+    color: #111;
+    margin-bottom: 2px;
+  }
+  .feature-text span { font-size: 12px; color: #6b7280; line-height: 1.4; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">&#9989;</div>
+  <h1>LinkedIn connected</h1>
+  <p class="subtitle">Claude now has access to your LinkedIn account.<br>Head back to Claude to get started.</p>
+  <div class="keep-open">
+    <span>&#9888;&#65039;</span>
+    Keep this tab open — Claude needs it to complete setup.
+  </div>
+  <div class="features">
+    <div class="features-label">What you can do now</div>
+    <div class="feature">
+      <div class="feature-icon">&#128221;</div>
+      <div class="feature-text">
+        <strong>Create &amp; manage posts</strong>
+        <span>Draft, publish, or delete LinkedIn posts directly from Claude.</span>
+      </div>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#128100;</div>
+      <div class="feature-text">
+        <strong>Read your full profile</strong>
+        <span>Experience, education, skills, headline — all accessible to Claude.</span>
+      </div>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#128276;</div>
+      <div class="feature-text">
+        <strong>Check notifications</strong>
+        <span>See who reacted, commented, or mentioned you.</span>
+      </div>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#128172;</div>
+      <div class="feature-text">
+        <strong>Browse conversations</strong>
+        <span>Review your recent LinkedIn DMs without leaving Claude.</span>
+      </div>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">&#9999;&#65039;</div>
+      <div class="feature-text">
+        <strong>Update your headline</strong>
+        <span>Let Claude help you craft and set a sharper headline.</span>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>"""
+
+_ERROR_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authorization failed</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #f3f4f6;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .card {
+    background: #fff;
+    border-radius: 16px;
+    box-shadow: 0 4px 24px rgba(0,0,0,.08);
+    max-width: 400px;
+    width: 100%;
+    padding: 48px 40px 40px;
+    text-align: center;
+  }
+  .icon { font-size: 48px; margin-bottom: 16px; }
+  h1 { font-size: 22px; font-weight: 700; color: #111; margin-bottom: 8px; }
+  p { font-size: 14px; color: #6b7280; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon">&#10060;</div>
+  <h1>Authorization failed</h1>
+  <p>Something went wrong during LinkedIn authorization.<br>
+     You can close this tab and try <code>authenticate</code> again from Claude.</p>
+</div>
+</body>
+</html>"""
+
+
 # ── Local callback server ──────────────────────────────────────────────────────
 
 class _CallbackHandler(BaseHTTPRequestHandler):
@@ -125,33 +303,18 @@ class _CallbackHandler(BaseHTTPRequestHandler):
                     f"State mismatch in OAuth callback — possible CSRF attempt. "
                     f"Expected {_CallbackHandler.expected_state!r}, got {received_state!r}."
                 )
-                body = (
-                    b"<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
-                    b"<h2>&#10007; Authorization failed</h2>"
-                    b"<p>State mismatch detected. Please close this window and try again.</p>"
-                    b"</body></html>"
-                )
+                body = _ERROR_PAGE.encode()
                 self.send_response(400)
             else:
                 _CallbackHandler.auth_code = params["code"][0]
-                body = (
-                    b"<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
-                    b"<h2>&#10003; LinkedIn authorization successful!</h2>"
-                    b"<p>You can close this window and return to Claude.</p>"
-                    b"</body></html>"
-                )
+                body = _SUCCESS_PAGE.encode()
                 self.send_response(200)
         elif "error" in params:
             _CallbackHandler.error = params.get("error_description", params.get("error", ["Unknown error"]))[0]
-            body = (
-                b"<html><body style='font-family:sans-serif;text-align:center;padding:60px'>"
-                b"<h2>&#10007; Authorization failed</h2>"
-                b"<p>Please close this window and check the error in Claude.</p>"
-                b"</body></html>"
-            )
+            body = _ERROR_PAGE.encode()
             self.send_response(400)
         else:
-            body = b"<html><body>Unexpected callback.</body></html>"
+            body = _ERROR_PAGE.encode()
             self.send_response(400)
 
         self.send_header("Content-Type", "text/html; charset=utf-8")
