@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import os
 import threading
 import time
@@ -29,6 +30,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import httpx
+
+_log = logging.getLogger("linkedin_mcp.client")
 
 try:
     from playwright.sync_api import sync_playwright as _sync_playwright
@@ -60,8 +63,15 @@ def _http_execute(client: httpx.Client, method: str, url: str, **kwargs: Any) ->
     for attempt in range(3):
         r: httpx.Response = getattr(client, method)(url, **kwargs)
         if r.status_code not in _RETRY_STATUSES:
+            if r.status_code >= 400:
+                _log.debug("HTTP %s %s → %d", method.upper(), url, r.status_code)
             r.raise_for_status()
             return r
+        _log.warning(
+            "HTTP %s %s → %d (attempt %d/3; backing off %.1fs)",
+            method.upper(), url, r.status_code, attempt + 1,
+            _RETRY_BACKOFF[attempt] if attempt < len(_RETRY_BACKOFF) else 0,
+        )
         last_exc = httpx.HTTPStatusError(
             f"HTTP {r.status_code}", request=r.request, response=r
         )
@@ -361,6 +371,18 @@ class VoyagerClient:
 
     _BLOCKED = {"image", "media", "font", "stylesheet", "other"}
 
+    def _inject_cookies(self) -> None:
+        """Re-inject li_at and JSESSIONID into the live Playwright context."""
+        cookies: list[dict] = [
+            {"name": "li_at", "value": self._li_at, "domain": ".linkedin.com", "path": "/"},
+        ]
+        if self._jsessionid:
+            cookies.append(
+                {"name": "JSESSIONID", "value": self._jsessionid, "domain": ".linkedin.com", "path": "/"}
+            )
+        self._context.add_cookies(cookies)
+        _log.debug("VoyagerClient: injected li_at/JSESSIONID into context")
+
     def _ensure_context(self) -> None:
         """Launch the persistent Playwright context on first use; reuse on subsequent calls."""
         with self._lock:
@@ -372,6 +394,7 @@ class VoyagerClient:
                     "Run the `authenticate` tool once to set up the browser session "
                     "needed for Voyager API access."
                 )
+            _log.debug("VoyagerClient: launching Playwright context at %s", self._user_data_dir)
             self._playwright = _sync_playwright().__enter__()
             self._context = self._playwright.chromium.launch_persistent_context(
                 self._user_data_dir,
@@ -385,7 +408,10 @@ class VoyagerClient:
                 if route.request.resource_type in VoyagerClient._BLOCKED
                 else route.continue_(),
             )
+            # Always re-inject credentials so the profile has fresh cookies on every open.
+            self._inject_cookies()
             atexit.register(self.close)
+            _log.info("VoyagerClient: Playwright context ready at %s", self._user_data_dir)
 
     def close(self) -> None:
         """Close the persistent browser context and release Playwright."""
@@ -428,6 +454,17 @@ class VoyagerClient:
                 timeout=self._timeout_ms,
             )
 
+        # If LinkedIn redirected to login/authwall, re-inject cookies and retry once.
+        if "/feed" not in page.url:
+            _log.warning("VoyagerClient: feed navigation landed on %s — re-injecting cookies", page.url)
+            self._inject_cookies()
+            page.goto(
+                "https://www.linkedin.com/feed/",
+                wait_until="domcontentloaded",
+                timeout=self._timeout_ms,
+            )
+            _log.debug("VoyagerClient: post-reinjection URL: %s", page.url)
+
         live_cookies = self._context.cookies("https://www.linkedin.com")
         live_jsessionid = next(
             (c["value"].strip('"') for c in live_cookies if c["name"] == "JSESSIONID"),
@@ -439,9 +476,11 @@ class VoyagerClient:
         )
 
         if result["status"] >= 400:
+            _log.error("Voyager API error %d for %s: %s", result["status"], url, result["body"][:300])
             raise RuntimeError(
                 f"Voyager API error {result['status']}: {result['body'][:300]}"
             )
+        _log.debug("Voyager %s %s → %d", method, url, result["status"])
         return json.loads(result["body"]) if result["body"] else {}
 
     def _get(self, path: str, params: Optional[dict] = None) -> Any:

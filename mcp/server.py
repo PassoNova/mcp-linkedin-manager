@@ -19,30 +19,26 @@ Tools exposed
   get_api_capabilities  – Explain what the standard API can/cannot do
   get_community_stats   – Connection count (partner scope; graceful fallback)
 
-LinkedIn API limitations
-────────────────────────
-The standard Consumer API (no partner-program approval required) supports:
-  ✅  Read basic profile (name, headline, photo, email)
-  ✅  Create, read, and delete UGC posts
-  ⚠️  Update headline (requires rw_me scope — may be rejected by LinkedIn)
-  ❌  Read/write experience, education, certifications, skills
-      → These require the restricted Profile API (LinkedIn partner program)
-  ❌  Read connections list or send connection requests
-      → Requires r_network / w_connections (partner-gated)
+Capability tiers
+────────────────
+  OAUTH    — valid token: get_profile, create_post, get_posts, delete_post
+  VOYAGER  — valid token + browser session: all of the above PLUS
+             get_full_profile, get_notifications, get_conversations,
+             get_recent_activity, update_headline
 
-Usage
-─────
-  1. Copy .env.example → .env and fill in your credentials.
-  2. pip install -r requirements.txt
-  3. python server.py
-  4. Add to Claude Code: claude mcp add linkedin-manager -- python /path/to/server.py
+Logs
+────
+  All tool calls are logged to ~/.linkedin_mcp.log with timing and outcome.
+  Tail it for live debugging: tail -f ~/.linkedin_mcp.log
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
+from contextlib import contextmanager
 from textwrap import dedent
 from typing import Optional
 
@@ -50,8 +46,13 @@ import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
+import log_config
+log_config.setup()
+
 from auth import (
     DEFAULT_PORT,
+    _HAS_KEYRING,
+    _browser_dir,
     deregister_alias,
     delete_credentials,
     delete_token,
@@ -70,13 +71,15 @@ from auth import (
     save_web_session,
     set_active_alias,
     validate_alias,
-    _browser_dir,
 )
 from client import LinkedInClient, VoyagerClient
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────
 
 load_dotenv()
+
+_log = logging.getLogger("linkedin_mcp.server")
+
 
 def _git_version() -> str:
     try:
@@ -90,6 +93,7 @@ def _git_version() -> str:
     except Exception:
         return "unknown"
 
+
 _SERVER_VERSION = _git_version()
 
 mcp = FastMCP(
@@ -101,6 +105,24 @@ mcp = FastMCP(
         confirm your identity before making any changes.
     """).strip(),
 )
+
+
+# ── Logging helpers ────────────────────────────────────────────────────────────
+
+@contextmanager
+def _tool_log(name: str, **ctx):
+    """Context manager that logs entry, exit, timing, and errors for a tool call."""
+    start = time.monotonic()
+    ctx_str = " ".join(f"{k}={v!r}" for k, v in ctx.items()) if ctx else ""
+    _log.info("TOOL %s START %s", name, ctx_str)
+    try:
+        yield
+        elapsed = time.monotonic() - start
+        _log.info("TOOL %s OK (%.2fs)", name, elapsed)
+    except Exception as exc:
+        elapsed = time.monotonic() - start
+        _log.error("TOOL %s ERROR (%.2fs): %s", name, elapsed, exc)
+        raise
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -117,13 +139,11 @@ def _credentials() -> tuple[str, str]:
             "to save them to the OS keychain, or set LINKEDIN_CLIENT_ID and "
             "LINKEDIN_CLIENT_SECRET in your environment or .env file."
         )
-    # Auto-migrate env-var credentials to keychain on first use.
     save_credentials(client_id, client_secret)
     return client_id, client_secret
 
 
 def _active_alias() -> str:
-    """Return the active alias or raise a helpful error."""
     alias = get_active_alias()
     if not alias:
         raise RuntimeError(
@@ -156,13 +176,20 @@ def _get_voyager_client(alias: Optional[str] = None) -> Optional[VoyagerClient]:
     alias = alias or _active_alias()
     session = load_web_session(alias)
     if not session:
+        _log.debug("No web session for '%s'; Voyager unavailable", alias)
         return None
     key = session.get("li_at", "")
     if alias not in _voyager_singletons or key != _voyager_session_keys.get(alias):
         if alias in _voyager_singletons:
+            _log.debug("Session changed for '%s'; recycling VoyagerClient", alias)
             _voyager_singletons[alias].close()
         bdir = _browser_dir(alias)
         udd = bdir if has_browser_profile(bdir) else None
+        _log.debug(
+            "Creating VoyagerClient for '%s' (browser_dir=%s)",
+            alias,
+            udd or "none — will navigate without persistent profile",
+        )
         _voyager_singletons[alias] = VoyagerClient(
             session["li_at"], session["jsessionid"], user_data_dir=udd
         )
@@ -174,6 +201,7 @@ def _invalidate_voyager(alias: Optional[str] = None) -> None:
     """Close and evict Voyager singleton(s). Pass alias to target one; None clears all."""
     if alias is not None:
         if alias in _voyager_singletons:
+            _log.debug("Invalidating VoyagerClient for '%s'", alias)
             _voyager_singletons[alias].close()
             del _voyager_singletons[alias]
             _voyager_session_keys.pop(alias, None)
@@ -182,6 +210,7 @@ def _invalidate_voyager(alias: Optional[str] = None) -> None:
             vc.close()
         _voyager_singletons.clear()
         _voyager_session_keys.clear()
+        _log.debug("All VoyagerClient singletons invalidated")
 
 
 def _format_error(exc: Exception) -> str:
@@ -228,43 +257,58 @@ async def authenticate(alias: str) -> str:
     Before calling this, app credentials must be available — run
     `python -m linkedin_mcp setup` or set LINKEDIN_CLIENT_ID / LINKEDIN_CLIENT_SECRET.
     """
-    try:
-        validate_alias(alias)
-        client_id, client_secret = _credentials()
+    with _tool_log("authenticate", alias=alias):
+        try:
+            validate_alias(alias)
+            client_id, client_secret = _credentials()
 
-        token_data, li_at, jsessionid, session_err = await run_oauth_flow(
-            client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
-        )
-        save_token(token_data, alias)
-        register_alias(alias)
-        _invalidate_voyager(alias)
-
-        scopes = token_data.get("scope", "unknown")
-        expires_in = token_data.get("expires_in", "unknown")
-
-        if li_at:
-            save_web_session(li_at, jsessionid or "", alias)
-            tier_note = "Voyager API enabled" if jsessionid else "Voyager API enabled (JSESSIONID will be refreshed on first use)"
-            session_note = f"   Web session    : captured automatically ({tier_note})\n"
-        elif session_err:
-            session_note = (
-                f"   Web session    : not captured ({session_err})\n"
-                "                    Run `authenticate` again to retry.\n"
+            token_data, li_at, jsessionid, session_err = await run_oauth_flow(
+                client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
             )
-        else:
-            session_note = (
-                "   Web session    : not captured — run `authenticate` again to retry\n"
-            )
+            save_token(token_data, alias)
+            register_alias(alias)
+            _invalidate_voyager(alias)
 
-        return (
-            f"✅ Authenticated as '{alias}'!\n"
-            f"   Scopes granted : {scopes}\n"
-            f"   Expires in     : {expires_in} seconds\n"
-            f"{session_note}\n"
-            f"'{alias}' is now the active account. Use `switch_user` to change accounts."
-        )
-    except Exception as exc:
-        return _format_error(exc)
+            scopes = token_data.get("scope", "unknown")
+            expires_in = token_data.get("expires_in", "unknown")
+
+            if li_at:
+                save_web_session(li_at, jsessionid or "", alias)
+                tier_note = (
+                    "Voyager API enabled"
+                    if jsessionid
+                    else "Voyager API enabled (JSESSIONID will be refreshed on first use)"
+                )
+                session_note = f"   Web session    : captured automatically ({tier_note})\n"
+                _log.info(
+                    "Authentication complete for '%s': tier=VOYAGER scopes=%s", alias, scopes
+                )
+            elif session_err:
+                session_note = (
+                    f"   Web session    : not captured ({session_err})\n"
+                    "                    Run `set_web_session` with cookies from your browser to enable Voyager tools.\n"
+                )
+                _log.info(
+                    "Authentication complete for '%s': tier=OAUTH scopes=%s session_err=%s",
+                    alias, scopes, session_err,
+                )
+            else:
+                session_note = (
+                    "   Web session    : not captured — run `authenticate` again to retry\n"
+                )
+                _log.info(
+                    "Authentication complete for '%s': tier=OAUTH scopes=%s", alias, scopes
+                )
+
+            return (
+                f"✅ Authenticated as '{alias}'!\n"
+                f"   Scopes granted : {scopes}\n"
+                f"   Expires in     : {expires_in} seconds\n"
+                f"{session_note}\n"
+                f"'{alias}' is now the active account. Use `switch_user` to change accounts."
+            )
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()
@@ -275,15 +319,17 @@ def logout(alias: str = "") -> str:
     Args:
         alias: Which account to log out. Leave empty to log out the active account.
     """
-    try:
-        target = alias.strip() or _active_alias()
-        delete_token(target)
-        delete_web_session(target)
-        _invalidate_voyager(target)
-        deregister_alias(target)
-        return f"✅ '{target}' logged out and removed."
-    except Exception as exc:
-        return _format_error(exc)
+    with _tool_log("logout", alias=alias or "(active)"):
+        try:
+            target = alias.strip() or _active_alias()
+            delete_token(target)
+            delete_web_session(target)
+            _invalidate_voyager(target)
+            deregister_alias(target)
+            _log.info("Logged out '%s'", target)
+            return f"✅ '{target}' logged out and removed."
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()
@@ -299,70 +345,71 @@ def check_auth() -> str:
       OAUTH   — valid token, OAuth tools available
       VOYAGER — valid token + browser session, all tools available
     """
-    from auth import _HAS_KEYRING
-    alias = get_active_alias()
-    credentials_in_keychain = load_credentials() is not None
+    with _tool_log("check_auth"):
+        alias = get_active_alias()
+        credentials_in_keychain = load_credentials() is not None
 
-    if not alias:
+        if not alias:
+            return json.dumps(
+                {
+                    "authenticated": False,
+                    "active_user": None,
+                    "tier": "BASE",
+                    "keychain_available": _HAS_KEYRING,
+                    "credentials_in_keychain": credentials_in_keychain,
+                    "message": "No users registered. Run `authenticate` with an alias.",
+                    "server_version": _SERVER_VERSION,
+                },
+                indent=2,
+            )
+
+        token_data = load_token(alias)
+
+        if not token_data:
+            return json.dumps(
+                {
+                    "authenticated": False,
+                    "active_user": alias,
+                    "tier": "BASE",
+                    "keychain_available": _HAS_KEYRING,
+                    "credentials_in_keychain": credentials_in_keychain,
+                    "message": f"No token for '{alias}'. Run `authenticate` again.",
+                    "server_version": _SERVER_VERSION,
+                },
+                indent=2,
+            )
+
+        obtained_at = token_data.get("_obtained_at", 0)
+        expires_in_secs = token_data.get("expires_in", 0)
+        expired = is_token_expired(token_data)
+        expiry_ts = obtained_at + expires_in_secs if (obtained_at and expires_in_secs) else None
+
+        if expired:
+            tier = "BASE"
+        elif load_web_session(alias):
+            tier = "VOYAGER"
+        else:
+            tier = "OAUTH"
+
+        _log.debug("check_auth: alias=%s tier=%s expired=%s", alias, tier, expired)
         return json.dumps(
             {
-                "authenticated": False,
-                "active_user": None,
-                "tier": "BASE",
-                "keychain_available": _HAS_KEYRING,
-                "credentials_in_keychain": credentials_in_keychain,
-                "message": "No users registered. Run `authenticate` with an alias.",
-                "server_version": _SERVER_VERSION,
-            },
-            indent=2,
-        )
-
-    token_data = load_token(alias)
-
-    if not token_data:
-        return json.dumps(
-            {
-                "authenticated": False,
                 "active_user": alias,
-                "tier": "BASE",
+                "authenticated": True,
+                "expired": expired,
+                "tier": tier,
+                "scopes": token_data.get("scope", "unknown"),
+                "expires_at": (
+                    time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expiry_ts))
+                    if expiry_ts
+                    else "unknown"
+                ),
                 "keychain_available": _HAS_KEYRING,
                 "credentials_in_keychain": credentials_in_keychain,
-                "message": f"No token for '{alias}'. Run `authenticate` again.",
                 "server_version": _SERVER_VERSION,
             },
             indent=2,
         )
-
-    obtained_at = token_data.get("_obtained_at", 0)
-    expires_in_secs = token_data.get("expires_in", 0)
-    expired = is_token_expired(token_data)
-    expiry_ts = obtained_at + expires_in_secs if (obtained_at and expires_in_secs) else None
-
-    if expired:
-        tier = "BASE"
-    elif load_web_session(alias):
-        tier = "VOYAGER"
-    else:
-        tier = "OAUTH"
-
-    return json.dumps(
-        {
-            "active_user": alias,
-            "authenticated": True,
-            "expired": expired,
-            "tier": tier,
-            "scopes": token_data.get("scope", "unknown"),
-            "expires_at": (
-                time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expiry_ts))
-                if expiry_ts
-                else "unknown"
-            ),
-            "keychain_available": _HAS_KEYRING,
-            "credentials_in_keychain": credentials_in_keychain,
-            "server_version": _SERVER_VERSION,
-        },
-        indent=2,
-    )
 
 
 @mcp.tool()
@@ -376,67 +423,66 @@ def get_profile() -> str:
     Fields like experience, education, and certifications are NOT available
     through the standard Consumer API — see `get_api_capabilities` for details.
     """
-    try:
-        client = _get_client()
-        info = client.get_userinfo()  # most reliable with openid + profile + email
+    with _tool_log("get_profile"):
+        try:
+            client = _get_client()
+            info = client.get_userinfo()
 
-        person_id = info.get("sub", "")
-        name = info.get("name") or f"{info.get('given_name', '')} {info.get('family_name', '')}".strip()
-        picture = info.get("picture", "")
-        email = info.get("email", "N/A")
-        locale = info.get("locale", {})
+            person_id = info.get("sub", "")
+            name = info.get("name") or f"{info.get('given_name', '')} {info.get('family_name', '')}".strip()
+            picture = info.get("picture", "")
+            email = info.get("email", "N/A")
+            locale = info.get("locale", {})
 
-        headline = ""
-        vanity = ""
-        source = "oauth"
+            headline = ""
+            vanity = ""
+            source = "oauth"
 
-        # Prefer Voyager when a web session is available — it has no scope restrictions.
-        voyager = _get_voyager_client()
-        if voyager:
-            try:
-                vme = voyager.get_me()
-                headline = vme.get("headline", "")
-                vanity = vme.get("public_id", "")
-                if vme.get("picture_url"):
-                    picture = vme["picture_url"]
-                source = "voyager"
-            except Exception:
-                # Voyager unavailable (e.g. playwright not installed) — fall through to OAuth
-                pass
+            voyager = _get_voyager_client()
+            if voyager:
+                try:
+                    vme = voyager.get_me()
+                    headline = vme.get("headline", "")
+                    vanity = vme.get("public_id", "")
+                    if vme.get("picture_url"):
+                        picture = vme["picture_url"]
+                    source = "voyager"
+                    _log.debug("get_profile: enriched with Voyager data (public_id=%s)", vanity)
+                except Exception as vex:
+                    _log.warning("get_profile: Voyager enrichment failed: %s", vex)
 
-        # Fall back to /v2/me (likely 403 without partner scopes, kept for completeness)
-        if not headline and source == "oauth":
-            try:
-                me = client.get_profile()
-                hl = me.get("headline", {})
-                if isinstance(hl, dict):
-                    localized = hl.get("localized", {})
-                    headline = list(localized.values())[0] if localized else ""
-                elif isinstance(hl, str):
-                    headline = hl
-                vanity = me.get("vanityName", "")
-            except Exception:
-                headline = ""  # /v2/me requires partner scopes; not available via standard OAuth
+            if not headline and source == "oauth":
+                try:
+                    me = client.get_profile()
+                    hl = me.get("headline", {})
+                    if isinstance(hl, dict):
+                        localized = hl.get("localized", {})
+                        headline = list(localized.values())[0] if localized else ""
+                    elif isinstance(hl, str):
+                        headline = hl
+                    vanity = me.get("vanityName", "")
+                except Exception:
+                    headline = ""
 
-        profile_url = (
-            f"https://www.linkedin.com/in/{vanity}" if vanity
-            else "https://www.linkedin.com/in/~"
-        )
+            profile_url = (
+                f"https://www.linkedin.com/in/{vanity}" if vanity
+                else "https://www.linkedin.com/in/~"
+            )
 
-        result = {
-            "id": person_id,
-            "name": name,
-            "headline": headline,
-            "email": email,
-            "profile_url": profile_url,
-            "picture_url": picture,
-            "locale": locale,
-            "person_urn": f"urn:li:person:{person_id}",
-            "headline_source": source,
-        }
-        return json.dumps(result, indent=2)
-    except Exception as exc:
-        return _format_error(exc)
+            result = {
+                "id": person_id,
+                "name": name,
+                "headline": headline,
+                "email": email,
+                "profile_url": profile_url,
+                "picture_url": picture,
+                "locale": locale,
+                "person_urn": f"urn:li:person:{person_id}",
+                "headline_source": source,
+            }
+            return json.dumps(result, indent=2)
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()
@@ -458,30 +504,32 @@ def update_headline(
     if len(headline) > 220:
         return f"❌ Headline is {len(headline)} characters. LinkedIn allows a maximum of 220."
 
-    # Prefer Voyager — works without partner-level OAuth scopes.
-    voyager = _get_voyager_client()
-    if voyager:
-        try:
-            # Need the public_id (vanity name) to build the PATCH URL.
-            vme = voyager.get_me()
-            public_id = vme.get("public_id", "")
-            if not public_id:
-                return "❌ Could not determine your LinkedIn public ID from the web session."
-            voyager.update_headline(headline, public_id)
-            return f"✅ Headline updated via web session:\n  \"{headline}\""
-        except Exception as exc:
-            return (
-                f"⚠️  Voyager update failed: {_format_error(exc)}\n"
-                "Falling back to OAuth API..."
-            ) + _try_oauth_headline(headline, locale)
+    with _tool_log("update_headline", chars=len(headline)):
+        voyager = _get_voyager_client()
+        if voyager:
+            try:
+                vme = voyager.get_me()
+                public_id = vme.get("public_id", "")
+                if not public_id:
+                    return "❌ Could not determine your LinkedIn public ID from the web session."
+                voyager.update_headline(headline, public_id)
+                _log.info("Headline updated via Voyager for public_id=%s", public_id)
+                return f"✅ Headline updated via web session:\n  \"{headline}\""
+            except Exception as exc:
+                _log.warning("Voyager headline update failed: %s", exc)
+                return (
+                    f"⚠️  Voyager update failed: {_format_error(exc)}\n"
+                    "Falling back to OAuth API..."
+                ) + _try_oauth_headline(headline, locale)
 
-    return _try_oauth_headline(headline, locale)
+        return _try_oauth_headline(headline, locale)
 
 
 def _try_oauth_headline(headline: str, locale: str) -> str:
     try:
         client = _get_client()
         client.update_headline(headline, locale=locale)
+        _log.info("Headline updated via OAuth API")
         return f"✅ Headline updated via OAuth:\n  \"{headline}\""
     except Exception as exc:
         return _format_error(exc)
@@ -514,30 +562,32 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
     if not li_at:
         return "❌ li_at is required."
 
-    try:
-        active = _active_alias()
-        # Validate using the existing browser profile — VoyagerClient requires the
-        # persistent Chromium profile to bypass LinkedIn's TLS fingerprinting.
-        bdir = _browser_dir(active)
-        udd = bdir if has_browser_profile(bdir) else None
-        vc = VoyagerClient(li_at, jsessionid, user_data_dir=udd)
-        me = vc.get_me()
-        name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
-        headline = me.get("headline", "")
-        save_web_session(li_at, jsessionid, active)
-        _invalidate_voyager(active)
-        return (
-            f"✅ Web session saved for '{active}'\n"
-            f"   Verified as  : {name}\n"
-            f"   Headline     : {headline or '(not set)'}\n\n"
-            "get_profile and update_headline will now use the Voyager API automatically."
-        )
-    except Exception as exc:
-        return (
-            f"❌ Session validation failed — browser profile may not have a valid LinkedIn session.\n"
-            f"   {_format_error(exc)}\n\n"
-            "Run `authenticate` first to set up the browser profile, then try again."
-        )
+    with _tool_log("set_web_session"):
+        try:
+            active = _active_alias()
+            bdir = _browser_dir(active)
+            udd = bdir if has_browser_profile(bdir) else None
+            _log.debug("set_web_session: validating session for '%s' (browser_dir=%s)", active, udd)
+            vc = VoyagerClient(li_at, jsessionid, user_data_dir=udd)
+            me = vc.get_me()
+            name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
+            headline = me.get("headline", "")
+            save_web_session(li_at, jsessionid, active)
+            _invalidate_voyager(active)
+            _log.info("Web session saved for '%s' (verified as %s)", active, name)
+            return (
+                f"✅ Web session saved for '{active}'\n"
+                f"   Verified as  : {name}\n"
+                f"   Headline     : {headline or '(not set)'}\n\n"
+                "get_profile and update_headline will now use the Voyager API automatically."
+            )
+        except Exception as exc:
+            _log.error("set_web_session failed: %s", exc)
+            return (
+                f"❌ Session validation failed — browser profile may not have a valid LinkedIn session.\n"
+                f"   {_format_error(exc)}\n\n"
+                "Run `authenticate` first to set up the browser profile, then try again."
+            )
 
 
 @mcp.tool()
@@ -548,15 +598,17 @@ def clear_web_session() -> str:
     After clearing, get_profile and update_headline fall back to the OAuth API
     (which cannot read/write the headline without partner-level scopes).
     """
-    try:
-        active = _active_alias()
-        existed = delete_web_session(active)
-        _invalidate_voyager(active)
-        if existed:
-            return f"✅ Web session cleared for '{active}'."
-        return f"ℹ️ No web session found for '{active}' — nothing to clear."
-    except Exception as exc:
-        return _format_error(exc)
+    with _tool_log("clear_web_session"):
+        try:
+            active = _active_alias()
+            existed = delete_web_session(active)
+            _invalidate_voyager(active)
+            if existed:
+                _log.info("Web session cleared for '%s'", active)
+                return f"✅ Web session cleared for '{active}'."
+            return f"ℹ️ No web session found for '{active}' — nothing to clear."
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()
@@ -570,11 +622,13 @@ def switch_user(alias: str) -> str:
     Args:
         alias: The alias to switch to. Must have been registered via authenticate.
     """
-    try:
-        set_active_alias(alias)
-        return f"✅ Switched to '{alias}'. All tools will now use this account."
-    except Exception as exc:
-        return _format_error(exc)
+    with _tool_log("switch_user", alias=alias):
+        try:
+            set_active_alias(alias)
+            _log.info("Active account switched to '%s'", alias)
+            return f"✅ Switched to '{alias}'. All tools will now use this account."
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()
@@ -585,25 +639,26 @@ def list_users() -> str:
     Shows which account is currently active and the capability tier
     (BASE / OAUTH / VOYAGER) for each.
     """
-    reg = load_user_registry()
-    active = reg.get("active")
-    users = []
-    for a in reg.get("aliases", []):
-        token = load_token(a)
-        expired = is_token_expired(token) if token else True
-        has_session = load_web_session(a) is not None
-        tier = (
-            "VOYAGER" if (token and not expired and has_session) else
-            "OAUTH" if (token and not expired) else
-            "BASE"
-        )
-        users.append({
-            "alias": a,
-            "active": a == active,
-            "tier": tier,
-            "authenticated": bool(token and not expired),
-        })
-    return json.dumps({"active": active, "users": users}, indent=2)
+    with _tool_log("list_users"):
+        reg = load_user_registry()
+        active = reg.get("active")
+        users = []
+        for a in reg.get("aliases", []):
+            token = load_token(a)
+            expired = is_token_expired(token) if token else True
+            has_session = load_web_session(a) is not None
+            tier = (
+                "VOYAGER" if (token and not expired and has_session) else
+                "OAUTH" if (token and not expired) else
+                "BASE"
+            )
+            users.append({
+                "alias": a,
+                "active": a == active,
+                "tier": tier,
+                "authenticated": bool(token and not expired),
+            })
+        return json.dumps({"active": active, "users": users}, indent=2)
 
 
 @mcp.tool()
@@ -615,14 +670,16 @@ def clear_credentials() -> str:
     LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET in your environment
     before calling authenticate again.
     """
-    removed = delete_credentials()
-    if removed:
-        return (
-            "✅ App credentials removed from the OS keychain.\n\n"
-            "Run `python -m linkedin_mcp setup` or set LINKEDIN_CLIENT_ID and "
-            "LINKEDIN_CLIENT_SECRET in your environment to re-add them."
-        )
-    return "ℹ️ No credentials found in the OS keychain — nothing to clear."
+    with _tool_log("clear_credentials"):
+        removed = delete_credentials()
+        if removed:
+            _log.info("App credentials removed from keychain")
+            return (
+                "✅ App credentials removed from the OS keychain.\n\n"
+                "Run `python -m linkedin_mcp setup` or set LINKEDIN_CLIENT_ID and "
+                "LINKEDIN_CLIENT_SECRET in your environment to re-add them."
+            )
+        return "ℹ️ No credentials found in the OS keychain — nothing to clear."
 
 
 @mcp.tool()
@@ -651,21 +708,23 @@ def create_post(
     if visibility not in ("PUBLIC", "CONNECTIONS"):
         return "❌ visibility must be 'PUBLIC' or 'CONNECTIONS'."
 
-    try:
-        client = _get_client()
-        person_urn = client.get_person_urn()
-        result = client.create_post(text, visibility=visibility, person_urn=person_urn)
+    with _tool_log("create_post", chars=len(text), visibility=visibility):
+        try:
+            client = _get_client()
+            person_urn = client.get_person_urn()
+            result = client.create_post(text, visibility=visibility, person_urn=person_urn)
 
-        post_urn = result.get("id", "unknown")
-        return (
-            f"✅ Post published successfully!\n"
-            f"   URN        : {post_urn}\n"
-            f"   Visibility : {visibility}\n"
-            f"   Characters : {len(text)}\n\n"
-            f"Save the URN above if you may want to delete this post later."
-        )
-    except Exception as exc:
-        return _format_error(exc)
+            post_urn = result.get("id", "unknown")
+            _log.info("Post created: urn=%s visibility=%s", post_urn, visibility)
+            return (
+                f"✅ Post published successfully!\n"
+                f"   URN        : {post_urn}\n"
+                f"   Visibility : {visibility}\n"
+                f"   Characters : {len(text)}\n\n"
+                f"Save the URN above if you may want to delete this post later."
+            )
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()
@@ -682,24 +741,26 @@ def get_recent_activity(count: int = 10) -> str:
     Requires a web session (run `authenticate` or `set_web_session` first).
     """
     count = max(1, min(count, 50))
-    try:
-        voyager = _get_voyager_client()
-        if not voyager:
-            return "❌ Web session required. Run `authenticate` or `set_web_session` first."
+    with _tool_log("get_recent_activity", count=count):
+        try:
+            voyager = _get_voyager_client()
+            if not voyager:
+                return "❌ Web session required. Run `authenticate` or `set_web_session` first."
 
-        me = voyager.get_me()
-        public_id = me.get("public_id", "")
-        if not public_id:
-            return "❌ Could not determine your LinkedIn public ID."
+            me = voyager.get_me()
+            public_id = me.get("public_id", "")
+            if not public_id:
+                return "❌ Could not determine your LinkedIn public ID."
 
-        posts = voyager.get_recent_posts(public_id, count=count)
-        return json.dumps(
-            {"public_id": public_id, "total_returned": len(posts), "posts": posts},
-            indent=2,
-            ensure_ascii=False,
-        )
-    except Exception as exc:
-        return _format_error(exc)
+            posts = voyager.get_recent_posts(public_id, count=count)
+            _log.info("get_recent_activity: returned %d posts for %s", len(posts), public_id)
+            return json.dumps(
+                {"public_id": public_id, "total_returned": len(posts), "posts": posts},
+                indent=2,
+                ensure_ascii=False,
+            )
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()
@@ -714,73 +775,76 @@ def get_posts(count: int = 10) -> str:
     visibility, and a preview of the text body.
     """
     count = max(1, min(count, 50))
-    try:
-        client = _get_client()
-        person_urn = client.get_person_urn()
-        elements = client.get_posts(count=count, person_urn=person_urn)
+    with _tool_log("get_posts", count=count):
+        try:
+            client = _get_client()
+            person_urn = client.get_person_urn()
+            elements = client.get_posts(count=count, person_urn=person_urn)
 
-        posts = []
-        for el in elements:
-            # REST /rest/posts format: flat fields.
-            # Fallback handles legacy ugcPosts shape if ever returned.
-            text = el.get("commentary", "")
-            if not text:
-                content = el.get("specificContent", {}).get(
-                    "com.linkedin.ugc.ShareContent", {}
+            posts = []
+            for el in elements:
+                text = el.get("commentary", "")
+                if not text:
+                    content = el.get("specificContent", {}).get(
+                        "com.linkedin.ugc.ShareContent", {}
+                    )
+                    text = content.get("shareCommentary", {}).get("text", "")
+
+                vis = el.get("visibility", "")
+                if isinstance(vis, dict):
+                    vis = vis.get("com.linkedin.ugc.MemberNetworkVisibility", "UNKNOWN")
+                vis = vis or "UNKNOWN"
+
+                created_ms = el.get("publishedAt") or el.get("lastModifiedAt", 0)
+                if not created_ms:
+                    created_ms = el.get("created", {}).get("time", 0) if isinstance(el.get("created"), dict) else 0
+                created_str = (
+                    time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(created_ms / 1000))
+                    if created_ms
+                    else "unknown"
                 )
-                text = content.get("shareCommentary", {}).get("text", "")
 
-            vis = el.get("visibility", "")
-            if isinstance(vis, dict):
-                vis = vis.get("com.linkedin.ugc.MemberNetworkVisibility", "UNKNOWN")
-            vis = vis or "UNKNOWN"
+                posts.append(
+                    {
+                        "urn": el.get("id", ""),
+                        "status": el.get("lifecycleState", ""),
+                        "visibility": vis,
+                        "created_at": created_str,
+                        "text_preview": (text[:300] + "…") if len(text) > 300 else text,
+                        "char_count": len(text),
+                    }
+                )
 
-            created_ms = el.get("publishedAt") or el.get("lastModifiedAt", 0)
-            if not created_ms:
-                created_ms = el.get("created", {}).get("time", 0) if isinstance(el.get("created"), dict) else 0
-            created_str = (
-                time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(created_ms / 1000))
-                if created_ms
-                else "unknown"
+            _log.info("get_posts (OAuth): returned %d posts", len(posts))
+            return json.dumps({"total_returned": len(posts), "posts": posts}, indent=2)
+        except Exception as exc:
+            _OAUTH_FALLBACK_CODES = {403, 426}
+            if not (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in _OAUTH_FALLBACK_CODES):
+                return _format_error(exc)
+            _oauth_exc = exc
+
+        # OAuth lacks r_member_social scope (or version mismatch) — fall back to Voyager.
+        _log.info("get_posts: OAuth returned %s; falling back to Voyager", _oauth_exc)
+        try:
+            voyager = _get_voyager_client()
+            if not voyager:
+                return (
+                    "❌ OAuth API is unavailable (scope or version issue) and no web session is set. "
+                    "Run `authenticate` or `set_web_session` to enable Voyager fallback."
+                )
+            me = voyager.get_me()
+            public_id = me.get("public_id", "")
+            if not public_id:
+                return "❌ Could not determine your LinkedIn public ID for Voyager fallback."
+            posts = voyager.get_recent_posts(public_id, count=count)
+            _log.info("get_posts (Voyager fallback): returned %d posts", len(posts))
+            return json.dumps(
+                {"source": "voyager", "total_returned": len(posts), "posts": posts},
+                indent=2,
+                ensure_ascii=False,
             )
-
-            posts.append(
-                {
-                    "urn": el.get("id", ""),
-                    "status": el.get("lifecycleState", ""),
-                    "visibility": vis,
-                    "created_at": created_str,
-                    "text_preview": (text[:300] + "…") if len(text) > 300 else text,
-                    "char_count": len(text),
-                }
-            )
-
-        return json.dumps(
-            {"total_returned": len(posts), "posts": posts},
-            indent=2,
-        )
-    except Exception as exc:
-        _OAUTH_FALLBACK_CODES = {403, 426}
-        if not (isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in _OAUTH_FALLBACK_CODES):
-            return _format_error(exc)
-
-    # OAuth lacks r_member_social scope (or version mismatch) — fall back to Voyager.
-    try:
-        voyager = _get_voyager_client()
-        if not voyager:
-            return "❌ OAuth API is unavailable (scope or version issue) and no web session is set. Run `authenticate` or `set_web_session` to enable Voyager fallback."
-        me = voyager.get_me()
-        public_id = me.get("public_id", "")
-        if not public_id:
-            return "❌ Could not determine your LinkedIn public ID for Voyager fallback."
-        posts = voyager.get_recent_posts(public_id, count=count)
-        return json.dumps(
-            {"source": "voyager", "total_returned": len(posts), "posts": posts},
-            indent=2,
-            ensure_ascii=False,
-        )
-    except Exception as exc:
-        return _format_error(exc)
+        except Exception as exc2:
+            return _format_error(exc2)
 
 
 @mcp.tool()
@@ -799,12 +863,14 @@ def delete_post(post_urn: str) -> str:
     if not post_urn:
         return "❌ post_urn cannot be empty."
 
-    try:
-        client = _get_client()
-        client.delete_post(post_urn)
-        return f"✅ Post deleted:\n   {post_urn}"
-    except Exception as exc:
-        return _format_error(exc)
+    with _tool_log("delete_post", urn=post_urn):
+        try:
+            client = _get_client()
+            client.delete_post(post_urn)
+            _log.info("Post deleted: %s", post_urn)
+            return f"✅ Post deleted:\n   {post_urn}"
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()
@@ -821,21 +887,23 @@ def get_full_profile(public_id: str = "") -> str:
 
     Requires a web session (run `authenticate` first).
     """
-    try:
-        voyager = _get_voyager_client()
-        if not voyager:
-            return "❌ Web session required. Run `authenticate` first."
+    with _tool_log("get_full_profile", public_id=public_id or "(self)"):
+        try:
+            voyager = _get_voyager_client()
+            if not voyager:
+                return "❌ Web session required. Run `authenticate` first."
 
-        if not public_id:
-            me = voyager.get_me()
-            public_id = me.get("public_id", "")
             if not public_id:
-                return "❌ Could not determine your LinkedIn public ID."
+                me = voyager.get_me()
+                public_id = me.get("public_id", "")
+                if not public_id:
+                    return "❌ Could not determine your LinkedIn public ID."
 
-        sections = voyager.get_profile_sections(public_id)
-        return json.dumps({"public_id": public_id, "sections": sections}, indent=2, ensure_ascii=False)
-    except Exception as exc:
-        return _format_error(exc)
+            sections = voyager.get_profile_sections(public_id)
+            _log.info("get_full_profile: scraped %d sections for %s", len(sections), public_id)
+            return json.dumps({"public_id": public_id, "sections": sections}, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()
@@ -849,19 +917,21 @@ def get_notifications(count: int = 20) -> str:
     Requires a web session (run `authenticate` first).
     """
     count = max(1, min(count, 50))
-    try:
-        voyager = _get_voyager_client()
-        if not voyager:
-            return "❌ Web session required. Run `authenticate` first."
+    with _tool_log("get_notifications", count=count):
+        try:
+            voyager = _get_voyager_client()
+            if not voyager:
+                return "❌ Web session required. Run `authenticate` first."
 
-        items = voyager.get_notifications(count=count)
-        return json.dumps(
-            {"total_returned": len(items), "notifications": items},
-            indent=2,
-            ensure_ascii=False,
-        )
-    except Exception as exc:
-        return _format_error(exc)
+            items = voyager.get_notifications(count=count)
+            _log.info("get_notifications: returned %d items", len(items))
+            return json.dumps(
+                {"total_returned": len(items), "notifications": items},
+                indent=2,
+                ensure_ascii=False,
+            )
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()
@@ -874,24 +944,26 @@ def get_conversations(count: int = 20) -> str:
 
     Requires a web session (run `authenticate` first).
     """
-    try:
-        voyager = _get_voyager_client()
-        if not voyager:
-            return "❌ Web session required. Run `authenticate` first."
+    with _tool_log("get_conversations", count=count):
+        try:
+            voyager = _get_voyager_client()
+            if not voyager:
+                return "❌ Web session required. Run `authenticate` first."
 
-        me = voyager.get_me()
-        entity_urn = me.get("entity_urn", "")
-        if not entity_urn:
-            return "❌ Could not determine your LinkedIn entity URN."
+            me = voyager.get_me()
+            entity_urn = me.get("entity_urn", "")
+            if not entity_urn:
+                return "❌ Could not determine your LinkedIn entity URN."
 
-        items = voyager.get_conversations(entity_urn, count=count)
-        return json.dumps(
-            {"total_returned": len(items), "conversations": items},
-            indent=2,
-            ensure_ascii=False,
-        )
-    except Exception as exc:
-        return _format_error(exc)
+            items = voyager.get_conversations(entity_urn, count=count)
+            _log.info("get_conversations: returned %d conversations", len(items))
+            return json.dumps(
+                {"total_returned": len(items), "conversations": items},
+                indent=2,
+                ensure_ascii=False,
+            )
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()
@@ -902,40 +974,41 @@ def get_api_capabilities() -> str:
     Call this before attempting profile-write or community operations to
     understand which features are available without partner-program access.
     """
-    alias = get_active_alias()
-    token_data = load_token(alias) if alias else None
-    scopes = token_data.get("scope", "unknown") if token_data else "not authenticated"
+    with _tool_log("get_api_capabilities"):
+        alias = get_active_alias()
+        token_data = load_token(alias) if alias else None
+        scopes = token_data.get("scope", "unknown") if token_data else "not authenticated"
 
-    capabilities = {
-        "current_scopes": scopes,
-        "oauth_api_available": {
-            "get_profile": "✅ Name, headline, email, profile picture, person URN",
-            "create_post": "✅ Publish text posts (PUBLIC or CONNECTIONS visibility)",
-            "get_posts": "✅ List your recent posts with text preview",
-            "delete_post": "✅ Remove a post you published",
-            "update_headline": (
-                "⚠️  Requires `rw_me` scope — most standard apps receive 403. "
-                "Voyager (web session) is more reliable for this."
-            ),
-        },
-        "voyager_available_after_authenticate": {
-            "get_profile": "✅ Full headline via Voyager (no partner scope needed)",
-            "update_headline": "✅ Works reliably via Voyager PATCH",
-            "get_full_profile": "✅ About, experience, education, skills — scraped via browser DOM",
-            "get_notifications": "✅ Recent notifications via Voyager REST endpoint",
-            "get_conversations": "✅ Recent DM conversations via Voyager GraphQL",
-        },
-        "not_available": {
-            "send_messages": "❌ w_messages scope not in Consumer API; Voyager write for messages not implemented",
-            "send_connection_requests": "❌ w_connections scope is partner-gated",
-            "reactions": "❌ Not exposed via Voyager without specific post URNs",
-            "search_people": "❌ Voyager search GraphQL queryId not yet captured",
-            "connections_list": "❌ Voyager connections GraphQL queryId not yet captured",
-        },
-        "linkedin_partner_program": "https://business.linkedin.com/marketing-solutions/partner-program",
-    }
+        capabilities = {
+            "current_scopes": scopes,
+            "oauth_api_available": {
+                "get_profile": "✅ Name, headline, email, profile picture, person URN",
+                "create_post": "✅ Publish text posts (PUBLIC or CONNECTIONS visibility)",
+                "get_posts": "✅ List your recent posts with text preview",
+                "delete_post": "✅ Remove a post you published",
+                "update_headline": (
+                    "⚠️  Requires `rw_me` scope — most standard apps receive 403. "
+                    "Voyager (web session) is more reliable for this."
+                ),
+            },
+            "voyager_available_after_authenticate": {
+                "get_profile": "✅ Full headline via Voyager (no partner scope needed)",
+                "update_headline": "✅ Works reliably via Voyager PATCH",
+                "get_full_profile": "✅ About, experience, education, skills — scraped via browser DOM",
+                "get_notifications": "✅ Recent notifications via Voyager REST endpoint",
+                "get_conversations": "✅ Recent DM conversations via Voyager GraphQL",
+            },
+            "not_available": {
+                "send_messages": "❌ w_messages scope not in Consumer API; Voyager write for messages not implemented",
+                "send_connection_requests": "❌ w_connections scope is partner-gated",
+                "reactions": "❌ Not exposed via Voyager without specific post URNs",
+                "search_people": "❌ Voyager search GraphQL queryId not yet captured",
+                "connections_list": "❌ Voyager connections GraphQL queryId not yet captured",
+            },
+            "linkedin_partner_program": "https://business.linkedin.com/marketing-solutions/partner-program",
+        }
 
-    return json.dumps(capabilities, indent=2)
+        return json.dumps(capabilities, indent=2)
 
 
 @mcp.tool()
@@ -947,15 +1020,17 @@ def get_community_stats() -> str:
     apps. This tool will return a clear explanation if the scope isn't
     available rather than failing silently.
     """
-    try:
-        client = _get_client()
-        result = client.get_connections_count()
-        return json.dumps(result, indent=2)
-    except Exception as exc:
-        return _format_error(exc)
+    with _tool_log("get_community_stats"):
+        try:
+            client = _get_client()
+            result = client.get_connections_count()
+            return json.dumps(result, indent=2)
+        except Exception as exc:
+            return _format_error(exc)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    _log.info("LinkedIn MCP server starting (version=%s)", _SERVER_VERSION)
     mcp.run()

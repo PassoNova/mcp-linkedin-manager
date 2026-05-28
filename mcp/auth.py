@@ -2,16 +2,24 @@
 LinkedIn OAuth 2.0 authentication module.
 
 Handles the full authorization code flow:
-  1. Build the authorization URL and open it in the user's browser
+  1. Build the authorization URL and open it in the user's system browser
   2. Spin up a temporary local HTTP server to receive the callback
   3. Exchange the authorization code for an access token
-  4. Persist the token to disk for future requests
+  4. Persist the token to disk / OS keychain for future requests
+
+Design decision: OAuth always uses the system browser (Chrome preferred, then
+default browser). Playwright's bundled Chromium is NOT used for the auth flow —
+it is unreliable in MCP server environments where macOS Application Firewall or
+security tooling may block the binary's outbound network connections.
+
+Playwright is used only for the optional Voyager profile initialization step,
+which runs headlessly after authentication with valid cookies already set.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
+import logging
 import os
 import re
 import secrets
@@ -25,7 +33,7 @@ from typing import Optional
 import httpx
 
 try:
-    from playwright.async_api import async_playwright, Route as PlaywrightRoute
+    from playwright.async_api import async_playwright
     _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     _PLAYWRIGHT_AVAILABLE = False
@@ -44,6 +52,10 @@ except ImportError:
     _HAS_BROWSER_COOKIE3 = False
 
 
+# ── Module logger ──────────────────────────────────────────────────────────────
+
+_log = logging.getLogger("linkedin_mcp.auth")
+
 _KR_SERVICE = "linkedin-mcp"
 _KR_KEY = "session"
 _KR_KEY_TOKEN = "oauth_token"
@@ -54,11 +66,6 @@ _KR_KEY_CREDS = "credentials"
 LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
 LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 
-# Standard scopes available without partner-program approval.
-# w_member_social  → create / delete posts
-# r_liteprofile    → id, name, headline, profile picture
-# r_emailaddress   → primary email address
-# r_basicprofile   → broader profile fields (summary, location, industry)
 SCOPES = [
     "openid",
     "profile",
@@ -113,7 +120,6 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         received_state = params.get("state", [None])[0]
 
         if "code" in params:
-            # Validate state token to prevent CSRF.
             if _CallbackHandler.expected_state and received_state != _CallbackHandler.expected_state:
                 _CallbackHandler.error = (
                     f"State mismatch in OAuth callback — possible CSRF attempt. "
@@ -173,7 +179,7 @@ def _wait_for_code(
     server = HTTPServer(("", port), _CallbackHandler)
 
     def _serve() -> None:
-        server.handle_request()  # handles exactly one request then returns
+        server.handle_request()
 
     t = Thread(target=_serve, daemon=True)
     t.start()
@@ -203,6 +209,7 @@ def exchange_code(
     redirect_uri: str,
 ) -> dict:
     """Exchange an authorization code for an access token."""
+    _log.debug("Exchanging authorization code for access token")
     resp = httpx.post(
         LINKEDIN_TOKEN_URL,
         data={
@@ -216,6 +223,7 @@ def exchange_code(
         timeout=30,
     )
     resp.raise_for_status()
+    _log.info("Access token obtained (expires_in=%s)", resp.json().get("expires_in"))
     return resp.json()
 
 
@@ -237,53 +245,42 @@ def _capture_chrome_linkedin_cookies() -> tuple[Optional[str], Optional[str], Op
             li_at = next((c.value for c in cj if c.name == "li_at"), None)
             jsessionid = next((c.value for c in cj if c.name == "JSESSIONID"), None)
             if li_at:
+                _log.info("Captured li_at from Chrome cookie store (attempt %d)", attempt + 1)
                 return li_at, jsessionid, None
         except Exception as exc:
             last_err = str(exc)
+            _log.debug("Cookie capture attempt %d failed: %s", attempt + 1, last_err)
             if attempt < 2:
                 time.sleep(3)
                 continue
             return None, None, f"cookie read failed: {last_err}"
-        # li_at not found yet — Chrome may not have flushed it; wait and retry
         if attempt < 2:
+            _log.debug("li_at not found yet, waiting for Chrome to flush cookies")
             time.sleep(3)
     return None, None, "li_at not found in Chrome's cookie store for .linkedin.com"
 
 
-def _is_playwright_binary_error(exc: Exception) -> bool:
-    """Return True when Playwright binary is missing or not installed."""
-    exc_str = str(exc)
-    return (
-        "executable doesn't exist" in exc_str
-        or "no such file" in exc_str.lower()
-        or "BrowserType" in type(exc).__name__
-        or "run `playwright install`" in exc_str
-    )
+def _is_chrome_available() -> bool:
+    """Return True if Google Chrome is installed on this system."""
+    chrome_paths = [
+        "/Applications/Google Chrome.app",
+        os.path.expanduser("~/Applications/Google Chrome.app"),
+    ]
+    return any(os.path.exists(p) for p in chrome_paths)
 
 
-def _is_playwright_network_error(exc: Exception) -> bool:
-    """Return True when Playwright's Chromium can't reach the network (e.g. proxy/VPN)."""
-    exc_str = str(exc)
-    return "ERR_CONNECTION_REFUSED" in exc_str or "net::" in exc_str
-
-
-async def _playwright_can_launch(browser_dir: str) -> tuple[bool, Optional[Exception]]:
-    """
-    Probe-launch Playwright Chromium headlessly to verify the binary exists and starts.
-    Returns (can_launch, exc_if_not). Closes the context immediately on success.
-    """
+def _open_in_chrome(url: str) -> bool:
+    """Open *url* in Google Chrome directly. Returns True if Chrome was found."""
+    import subprocess
     try:
-        async with async_playwright() as p:
-            os.makedirs(browser_dir, exist_ok=True)
-            ctx = await p.chromium.launch_persistent_context(
-                browser_dir,
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            await ctx.close()
-        return True, None
-    except Exception as exc:
-        return False, exc
+        subprocess.run(
+            ["open", "-a", "Google Chrome", url],
+            check=True, capture_output=True,
+        )
+        _log.info("Opened OAuth URL in Chrome")
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
 
 
 async def _init_headless_profile(
@@ -295,15 +292,14 @@ async def _init_headless_profile(
     Seed a headless Playwright profile with cookies captured from Chrome.
 
     Injects li_at (and JSESSIONID if present), navigates to linkedin.com/feed/
-    so Cloudflare fingerprints the context and LinkedIn issues/refreshes
-    JSESSIONID.  The resulting persistent profile is what VoyagerClient reuses
-    for every subsequent API call.
+    so LinkedIn issues/refreshes JSESSIONID. The resulting persistent profile is
+    what VoyagerClient reuses for every subsequent API call.
 
-    Returns (jsessionid_final, error_message).  error_message is None on success.
-    On failure the original jsessionid is returned unchanged so the caller can
-    still save the session even without a fully warmed profile.
+    Returns (jsessionid_final, error_message). error_message is None on success.
+    On failure the original jsessionid is returned unchanged.
     """
     try:
+        _log.debug("Initializing Playwright headless profile at %s", browser_dir)
         async with async_playwright() as p:
             os.makedirs(browser_dir, exist_ok=True)
             context = await p.chromium.launch_persistent_context(
@@ -327,8 +323,8 @@ async def _init_headless_profile(
                     wait_until="domcontentloaded",
                     timeout=15_000,
                 )
-            except Exception:
-                pass  # best-effort; profile directory is still written
+            except Exception as nav_err:
+                _log.debug("Feed navigation during profile init: %s (non-fatal)", nav_err)
 
             live_cookies = await context.cookies("https://www.linkedin.com")
             jsessionid_final = next(
@@ -336,9 +332,46 @@ async def _init_headless_profile(
                 jsessionid,
             )
             await context.close()
+        _log.info("Playwright headless profile initialized at %s", browser_dir)
         return jsessionid_final, None
     except Exception as exc:
+        _log.warning("Headless profile init failed: %s", exc)
         return jsessionid, f"headless profile init failed: {exc}"
+
+
+def _run_oauth_flow_browser(client_id: str, client_secret: str, port: int) -> tuple[dict, bool]:
+    """
+    OAuth flow using system browser + local HTTP callback server.
+
+    Returns (token_data, opened_via_chrome).
+
+    Prefers Chrome explicitly (so browser-cookie3 can capture li_at afterwards)
+    and falls back to webbrowser.open() when Chrome isn't available.
+    """
+    redirect_uri = f"http://localhost:{port}/callback"
+    state = secrets.token_urlsafe(16)
+    auth_url = build_auth_url(client_id, redirect_uri, state)
+
+    _log.info("Starting OAuth flow — opening browser to LinkedIn authorization page")
+    opened_via_chrome = _open_in_chrome(auth_url)
+    if not opened_via_chrome:
+        _log.info("Chrome not found; using default browser (Voyager session capture unavailable)")
+        webbrowser.open(auth_url)
+
+    _log.debug("Waiting for OAuth callback on localhost:%d (timeout 120s)", port)
+    code, error = _wait_for_code(port, expected_state=state)
+
+    if error:
+        _log.error("OAuth callback error: %s", error)
+        raise RuntimeError(f"LinkedIn authorization failed: {error}")
+    if not code:
+        _log.error("OAuth callback timed out")
+        raise RuntimeError("Timed out waiting for LinkedIn authorization. Please try again.")
+
+    _log.info("Authorization code received; exchanging for token")
+    token_data = exchange_code(code, client_id, client_secret, redirect_uri)
+    token_data["_obtained_at"] = int(time.time())
+    return token_data, opened_via_chrome
 
 
 async def run_oauth_flow(
@@ -350,179 +383,38 @@ async def run_oauth_flow(
     """
     Full interactive OAuth flow. Returns (token_data, li_at, jsessionid, session_error).
 
-    Primary path — Playwright headful:
-      Run the full OAuth flow inside Playwright's bundled Chromium so that auth,
-      cookie capture, and profile creation all happen in one persistent browser
-      context.  VoyagerClient reuses this same profile so LinkedIn always sees a
-      consistent fingerprint.
+    Always uses the system browser (Chrome preferred) with a local callback server.
+    Playwright is NOT used for the auth flow — it is unreliable in MCP server
+    environments where the OS may block Playwright's Chromium binary from
+    making outbound network connections.
 
-    Fallback — system Chrome + cookie capture (Playwright not installed):
-      Opens the OAuth URL in Chrome and reads li_at via browser-cookie3.
-      Voyager API will not be available because there is no Playwright profile.
+    After token exchange:
+      1. If Chrome was used: captures li_at / JSESSIONID from Chrome's cookie store.
+      2. If li_at captured and Playwright is available: initializes a headless
+         Playwright profile with those cookies so VoyagerClient can reuse it.
 
     Raises RuntimeError on failure or timeout.
     """
-    # ── Primary: Playwright headful (consistent fingerprint for Voyager API) ────
-    if _PLAYWRIGHT_AVAILABLE:
-        try:
-            token_data, li_at, jsessionid = await _run_oauth_flow_playwright(
-                client_id, client_secret, port, browser_dir
-            )
-            err = None if li_at else "li_at cookie not found in Playwright browser context"
-            return token_data, li_at, jsessionid, err
-        except Exception as exc:
-            # Only fall back to system browser when the Playwright binary itself is
-            # missing.  Network errors with a working binary should not open a second
-            # browser — that confuses the user who is already watching Chromium.
-            if not _is_playwright_binary_error(exc):
-                raise
-
-    # ── Fallback: system browser (Playwright binary not installed) ──────────────
     token_data, opened_via_chrome = _run_oauth_flow_browser(client_id, client_secret, port)
-    if opened_via_chrome:
-        li_at, jsessionid, cookie_err = _capture_chrome_linkedin_cookies()
-        return token_data, li_at, jsessionid, cookie_err
-    return token_data, None, None, "Playwright is not installed and system browser is not Chrome; run `set_web_session` manually"
 
-
-async def _run_oauth_flow_playwright(
-    client_id: str,
-    client_secret: str,
-    port: int,
-    browser_dir: str = DEFAULT_BROWSER_DIR,
-) -> tuple[dict, Optional[str], Optional[str]]:
-    """
-    OAuth flow driven by a Playwright headful persistent context.
-
-    launch_persistent_context stores the full browser fingerprint (cookies,
-    localStorage, canvas seeds, etc.) in browser_dir.  VoyagerClient reuses
-    this same profile so LinkedIn always sees a consistent identity.
-
-    Uses a real local HTTP server to capture the OAuth callback (same as the
-    browser fallback) rather than Playwright route interception.  This avoids
-    net::ERR_CONNECTION_REFUSED errors that occur when Playwright tries to
-    navigate to the localhost callback URL before the route handler fires.
-    """
-    redirect_uri = f"http://localhost:{port}/callback"
-    state = secrets.token_urlsafe(16)
-    auth_url = build_auth_url(client_id, redirect_uri, state)
-
-    # Start the callback server BEFORE opening the browser so the port is
-    # already bound when LinkedIn redirects back.
-    _CallbackHandler.auth_code = None
-    _CallbackHandler.error = None
-    _CallbackHandler.expected_state = state
-
-    server = HTTPServer(("", port), _CallbackHandler)
-
-    def _serve() -> None:
-        server.handle_request()
-
-    server_thread = Thread(target=_serve, daemon=True)
-    server_thread.start()
-
-    try:
-        async with async_playwright() as p:
-            os.makedirs(browser_dir, exist_ok=True)
-            context = await p.chromium.launch_persistent_context(
-                browser_dir,
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            page = await context.new_page()
-            await page.goto(auth_url)
-
-            # Block until the HTTP server captures the callback (user logs in
-            # and approves on LinkedIn, which redirects to localhost).
-            await asyncio.get_event_loop().run_in_executor(
-                None, server_thread.join, 120
-            )
-
-            code = _CallbackHandler.auth_code
-            error = _CallbackHandler.error
-
-            if error:
-                await context.close()
-                raise RuntimeError(f"LinkedIn authorization failed: {error}")
-            if not code:
-                await context.close()
-                raise RuntimeError("Timed out waiting for LinkedIn authorization. Please try again.")
-
-            # Navigate to LinkedIn feed so the server issues JSESSIONID before
-            # we read cookies — JSESSIONID is only set on real page requests.
-            try:
-                await page.goto(
-                    "https://www.linkedin.com/feed/",
-                    wait_until="domcontentloaded",
-                    timeout=15_000,
-                )
-            except Exception:
-                pass  # best-effort; li_at is the critical cookie
-
-            raw_cookies = await context.cookies("https://www.linkedin.com")
-            li_at = next((c["value"] for c in raw_cookies if c["name"] == "li_at"), None)
-            jsessionid = next((c["value"] for c in raw_cookies if c["name"] == "JSESSIONID"), None)
-
-            await context.close()
-
-        token_data = exchange_code(code, client_id, client_secret, redirect_uri)
-        token_data["_obtained_at"] = int(time.time())
-        return token_data, li_at, jsessionid
-    finally:
-        server.server_close()
-
-
-def _is_chrome_available() -> bool:
-    """Return True if Google Chrome is installed on this system."""
-    # macOS: check standard app bundle locations.
-    chrome_paths = [
-        "/Applications/Google Chrome.app",
-        os.path.expanduser("~/Applications/Google Chrome.app"),
-    ]
-    return any(os.path.exists(p) for p in chrome_paths)
-
-
-def _open_in_chrome(url: str) -> bool:
-    """Open *url* in Google Chrome directly. Returns True if Chrome was found."""
-    import subprocess
-    # macOS: 'open -a' forces the URL to open in Chrome regardless of default browser.
-    try:
-        subprocess.run(
-            ["open", "-a", "Google Chrome", url],
-            check=True, capture_output=True,
-        )
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
-
-
-def _run_oauth_flow_browser(client_id: str, client_secret: str, port: int) -> tuple[dict, bool]:
-    """
-    OAuth flow using a local callback server.
-
-    Returns (token_data, opened_via_chrome).
-
-    Prefers opening Chrome explicitly (so browser-cookie3 can capture li_at
-    afterwards) and falls back to webbrowser.open() when Chrome isn't available.
-    """
-    redirect_uri = f"http://localhost:{port}/callback"
-    state = secrets.token_urlsafe(16)
-    auth_url = build_auth_url(client_id, redirect_uri, state)
-
-    opened_via_chrome = _open_in_chrome(auth_url)
     if not opened_via_chrome:
-        webbrowser.open(auth_url)
+        return (
+            token_data, None, None,
+            "Chrome not found; Voyager session not captured. "
+            "Run `set_web_session` with cookies from your browser to enable Voyager tools."
+        )
 
-    code, error = _wait_for_code(port, expected_state=state)
+    li_at, jsessionid, cookie_err = _capture_chrome_linkedin_cookies()
+    if not li_at:
+        _log.warning("Voyager session capture failed: %s", cookie_err)
+        return token_data, None, None, cookie_err
 
-    if error:
-        raise RuntimeError(f"LinkedIn authorization failed: {error}")
-    if not code:
-        raise RuntimeError("Timed out waiting for LinkedIn authorization. Please try again.")
+    if _PLAYWRIGHT_AVAILABLE:
+        jsessionid, _ = await _init_headless_profile(li_at, jsessionid, browser_dir)
+    else:
+        _log.info("Playwright not available — skipping headless profile init")
 
-    token_data = exchange_code(code, client_id, client_secret, redirect_uri)
-    token_data["_obtained_at"] = int(time.time())
-    return token_data, opened_via_chrome
+    return token_data, li_at, jsessionid, None
 
 
 # ── Token persistence (per-user, keyed by alias) ───────────────────────────────
@@ -533,14 +425,16 @@ def save_token(token_data: dict, alias: str) -> None:
     if _HAS_KEYRING:
         try:
             keyring.set_password(_KR_SERVICE, key, json.dumps(token_data))
+            _log.debug("Token for '%s' saved to OS keychain", alias)
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("Keychain save failed, using file: %s", exc)
     path = _token_path(alias)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as fh:
         json.dump(token_data, fh, indent=2)
     os.chmod(path, 0o600)
+    _log.debug("Token for '%s' saved to %s", alias, path)
 
 
 def load_token(alias: str) -> Optional[dict]:
@@ -563,8 +457,7 @@ def load_token(alias: str) -> Optional[dict]:
 def is_token_expired(token_data: dict, buffer_seconds: int = 300) -> bool:
     """
     Return True if the access token has expired (or will expire within
-    *buffer_seconds*).  Returns False when expiry information is unavailable
-    (we optimistically assume it's still valid).
+    *buffer_seconds*). Returns False when expiry information is unavailable.
     """
     obtained_at = token_data.get("_obtained_at")
     expires_in = token_data.get("expires_in")
@@ -587,6 +480,7 @@ def delete_token(alias: str) -> bool:
     if os.path.exists(path):
         os.remove(path)
         deleted = True
+    _log.debug("Token for '%s' deleted: %s", alias, deleted)
     return deleted
 
 
@@ -599,14 +493,16 @@ def save_web_session(li_at: str, jsessionid: str, alias: str) -> None:
     if _HAS_KEYRING:
         try:
             keyring.set_password(_KR_SERVICE, key, json.dumps(data))
+            _log.debug("Web session for '%s' saved to OS keychain", alias)
             return
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.debug("Keychain session save failed, using file: %s", exc)
     path = _session_path(alias)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as fh:
         json.dump(data, fh, indent=2)
     os.chmod(path, 0o600)
+    _log.debug("Web session for '%s' saved to %s", alias, path)
 
 
 def load_web_session(alias: str) -> Optional[dict]:
@@ -640,6 +536,7 @@ def delete_web_session(alias: str) -> bool:
     if os.path.exists(path):
         os.remove(path)
         deleted = True
+    _log.debug("Web session for '%s' deleted: %s", alias, deleted)
     return deleted
 
 
@@ -652,6 +549,7 @@ def save_credentials(client_id: str, client_secret: str) -> bool:
     try:
         data = {"client_id": client_id, "client_secret": client_secret}
         keyring.set_password(_KR_SERVICE, _KR_KEY_CREDS, json.dumps(data))
+        _log.debug("App credentials saved to OS keychain")
         return True
     except Exception:
         return False

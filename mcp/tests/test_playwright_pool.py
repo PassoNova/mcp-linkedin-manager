@@ -91,10 +91,31 @@ class TestEnsureContext:
 class TestBrowserRequest:
     def test_goto_feed_called_when_not_on_linkedin(self, mock_playwright):
         mock_playwright["page"].url = "about:blank"
+
+        def update_url(*args, **kwargs):
+            mock_playwright["page"].url = "https://www.linkedin.com/feed/"
+
+        mock_playwright["page"].goto.side_effect = update_url
         vc = _make_vc()
         vc._browser_request("/me", "GET", None)
         mock_playwright["page"].goto.assert_called_once()
         assert "feed" in mock_playwright["page"].goto.call_args[0][0]
+
+    def test_retry_when_redirected_to_login(self, mock_playwright):
+        """If LinkedIn redirects away from /feed (e.g. to /login), cookies are re-injected and navigation retried."""
+        urls = iter(["about:blank", "https://www.linkedin.com/login", "https://www.linkedin.com/feed/"])
+
+        def advance_url(*args, **kwargs):
+            mock_playwright["page"].url = next(urls)
+
+        mock_playwright["page"].url = "about:blank"
+        mock_playwright["page"].goto.side_effect = advance_url
+        vc = _make_vc()
+        vc._browser_request("/me", "GET", None)
+        # First goto: initial navigation (about:blank → linkedin/login)
+        # Second goto: retry after detecting non-feed URL (linkedin/login → feed)
+        assert mock_playwright["page"].goto.call_count == 2
+        mock_playwright["context"].add_cookies.assert_called()
 
     def test_goto_feed_skipped_when_already_on_linkedin(self, mock_playwright):
         mock_playwright["page"].url = "https://www.linkedin.com/feed/"
