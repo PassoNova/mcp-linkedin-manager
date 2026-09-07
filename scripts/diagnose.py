@@ -107,7 +107,12 @@ def check_playwright() -> bool:
         return False
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "mcp"))
-    from auth import probe_playwright_network, resolve_auth_mode
+    try:
+        from auth import probe_playwright_network, resolve_auth_mode
+    except Exception as exc:  # missing dependency, syntax error, etc.
+        print(f"  {FAIL} Could not import mcp/auth.py for the network probe: {exc}")
+        print("        Run `uv sync` inside mcp/ and re-run diagnostics.")
+        return False
 
     err = probe_playwright_network()
     if err is None:

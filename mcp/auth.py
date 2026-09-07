@@ -483,11 +483,31 @@ def _open_in_chrome(url: str) -> bool:
 AUTH_MODE = os.environ.get("LINKEDIN_AUTH_MODE", "auto").strip().lower()
 AUTH_MODES = ("auto", "playwright", "browser")
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Read a positive integer from the environment, falling back to *default*.
+
+    A bad value logs a warning instead of raising, so a typo in
+    LINKEDIN_AUTH_TIMEOUT cannot stop the server or CLI from starting.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        _log.warning("%s=%r is not an integer; using default %d", name, raw, default)
+        return default
+    if value < minimum:
+        _log.warning("%s=%d is below the minimum %d; using default %d", name, value, minimum, default)
+        return default
+    return value
+
+
 # Seconds to wait for the user to finish logging in / approving the app.
-AUTH_TIMEOUT = int(os.environ.get("LINKEDIN_AUTH_TIMEOUT", "300"))
+AUTH_TIMEOUT = _env_int("LINKEDIN_AUTH_TIMEOUT", 300)
 
 # Milliseconds for the headless network probe and initial page loads.
-PROBE_TIMEOUT_MS = int(os.environ.get("LINKEDIN_PROBE_TIMEOUT_MS", "15000"))
+PROBE_TIMEOUT_MS = _env_int("LINKEDIN_PROBE_TIMEOUT_MS", 15000, minimum=100)
 
 _LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
 _FEED_URL = "https://www.linkedin.com/feed/"

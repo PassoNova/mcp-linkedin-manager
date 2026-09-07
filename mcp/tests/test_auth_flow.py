@@ -630,3 +630,29 @@ class TestRunOAuthFlowPlaywright:
         token, li_at, jsess = self.auth._run_oauth_flow_playwright("cid", "csec", 9999, self.browser_dir)
         assert token["access_token"] == "tok"
         assert li_at is None and jsess is None
+
+
+# ── _env_int ──────────────────────────────────────────────────────────────────
+
+class TestEnvInt:
+    def test_default_when_unset(self, monkeypatch):
+        import auth
+        monkeypatch.delenv("LINKEDIN_X_TEST", raising=False)
+        assert auth._env_int("LINKEDIN_X_TEST", 42) == 42
+
+    def test_parses_valid_value(self, monkeypatch):
+        import auth
+        monkeypatch.setenv("LINKEDIN_X_TEST", " 7 ")
+        assert auth._env_int("LINKEDIN_X_TEST", 42) == 7
+
+    def test_non_integer_falls_back_with_warning(self, monkeypatch, caplog):
+        import auth
+        monkeypatch.setenv("LINKEDIN_X_TEST", "five")
+        with caplog.at_level("WARNING", logger="linkedin_mcp.auth"):
+            assert auth._env_int("LINKEDIN_X_TEST", 42) == 42
+        assert "not an integer" in caplog.text
+
+    def test_below_minimum_falls_back(self, monkeypatch):
+        import auth
+        monkeypatch.setenv("LINKEDIN_X_TEST", "0")
+        assert auth._env_int("LINKEDIN_X_TEST", 42) == 42
