@@ -88,24 +88,44 @@ def check_chrome() -> bool:
 
 
 def check_playwright() -> bool:
-    _section("Playwright (needed for Voyager API scraping)")
+    _section("Playwright (login window + Voyager API scraping)")
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        print(f"  {WARN} Playwright not installed. Voyager tools will be unavailable.")
+        print(f"  {WARN} Playwright not installed. The login window and Voyager tools will be unavailable;")
+        print("        `authenticate` will use the system browser instead.")
         print("        Install with: pip install playwright && playwright install chromium")
-        return True  # Warning only
-
+        return True  # optional component: warn, do not fail the diagnostics
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             browser.close()
         print(f"  {PASS} Playwright Chromium launches successfully")
-        return True
     except Exception as exc:
         print(f"  {FAIL} Playwright Chromium launch failed: {exc}")
         print("        Try: playwright install chromium")
         return False
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "mcp"))
+    try:
+        from auth import probe_playwright_network, resolve_auth_mode
+    except Exception as exc:  # missing dependency, syntax error, etc.
+        print(f"  {FAIL} Could not import mcp/auth.py for the network probe: {exc}")
+        print("        Run `uv sync` inside mcp/ and re-run diagnostics.")
+        return False
+
+    err = probe_playwright_network()
+    if err is None:
+        print(f"  {PASS} Playwright Chromium can reach linkedin.com")
+    else:
+        print(f"  {WARN} Playwright Chromium cannot reach linkedin.com: {err}")
+        print("        A firewall (macOS Application Firewall, Little Snitch) may be blocking the")
+        print("        bundled Chromium. `authenticate` will fall back to the system browser and")
+        print("        Chrome cookie capture, which needs keychain access to Chrome Safe Storage.")
+    mode = resolve_auth_mode()
+    chosen = "Playwright login window" if (mode == "playwright" or (mode == "auto" and err is None)) else "system browser"
+    print(f"  {PASS} LINKEDIN_AUTH_MODE={mode} → authenticate will use: {chosen}")
+    return True  # the probe result only selects the auth path; the fallback still works
 
 
 def check_credentials() -> bool:

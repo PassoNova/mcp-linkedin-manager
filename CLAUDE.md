@@ -7,27 +7,34 @@ This is a Model Context Protocol (MCP) server that exposes LinkedIn functionalit
 | Tier | Requires | Capabilities |
 |------|----------|-------------|
 | **OAUTH** | Valid access token | get_profile (basic), create_post, get_posts, delete_post |
-| **VOYAGER** | Token + browser session | All OAUTH tools + get_full_profile, get_notifications, get_conversations, get_recent_activity, update_headline |
+| **VOYAGER** | Token + browser session | All OAUTH tools + get_full_profile, get_notifications, get_conversations, get_recent_activity, update_headline, refresh_web_session |
 
 ---
 
 ## Key Architecture Decisions
 
-### 1. OAuth uses system browser — never Playwright
+### 1. The login happens inside a Playwright window on the per-alias profile
 
-**Decision:** The OAuth flow always opens the system browser (Chrome preferred) with a local HTTP callback server at `localhost:8919`. Playwright is never used for the auth dance.
+**Decision:** `authenticate` opens a *headed* Playwright Chromium window using the alias's persistent profile (`~/.linkedin_mcp_browser_<alias>/`) and navigates it to LinkedIn's authorization page. A local HTTP callback server at `localhost:8919` still receives the OAuth redirect. After the user approves, the Voyager cookies (`li_at`, `JSESSIONID`) are read straight from that profile.
 
-**Why:** Playwright's bundled Chromium runs as a subprocess. On macOS, the Application Firewall or security tools (e.g., Little Snitch) can block the Playwright binary from making outbound network connections, causing `ERR_CONNECTION_REFUSED` even though the same URLs are reachable from Chrome. Since the user must interact with the browser anyway (to log in), using the system browser is both more reliable and more natural.
+**Why:** VoyagerClient reuses the exact same profile headlessly, so the cookies match the browser fingerprint LinkedIn saw at login (LinkedIn's Cloudflare protection rejects cookies moved into a different fingerprint). It also removes the two things that kept breaking session capture: reading Chrome's encrypted cookie store with `browser_cookie3`, and the macOS Keychain access that requires for *Chrome Safe Storage* (the "Unable to get key for cookie decryption" failure).
 
-**What Playwright IS used for:**
-- Optional headless profile initialization after OAuth (injecting cookies, best-effort)
-- VoyagerClient: all web scraping operations (these use an already-authenticated session, so LinkedIn's fingerprinting is satisfied by the valid cookies)
+**Firewall guard:** before opening the window, `auth.probe_playwright_network()` loads linkedin.com headlessly. If the bundled Chromium cannot reach the network (macOS Application Firewall, Little Snitch, `ERR_CONNECTION_REFUSED`), the flow falls back to decision 2 automatically. The fallback happens *only* when the user never got to interact: a timeout, a closed window, or a denied consent is reported as an error rather than opening a second browser.
 
-### 2. Voyager session is captured automatically from Chrome cookies
+**Override:** `LINKEDIN_AUTH_MODE=auto|playwright|browser` (default `auto`). `LINKEDIN_AUTH_TIMEOUT` (default 300 s) bounds how long the window waits for the user; `LINKEDIN_PROBE_TIMEOUT_MS` (default 15000) bounds the probe and page loads.
 
-After the OAuth token is obtained, `auth._capture_chrome_linkedin_cookies()` reads `li_at` and `JSESSIONID` from Chrome's cookie store using `browser_cookie3`. This happens automatically when Chrome was used for the OAuth flow.
+**Threading:** all Playwright helpers in `auth.py` use the *sync* API and run on a worker thread (`asyncio.to_thread` from async tools, `auth._run_in_thread` from sync tools), because Playwright's sync API refuses to run on the server's asyncio thread.
 
-If Chrome was not used (e.g., default browser is Firefox), the user must run `set_web_session` manually.
+### 2. Fallback: system browser + Chrome cookie-store capture
+
+When the probe fails or Playwright is not installed, the OAuth URL opens in the system browser (Chrome preferred) and, after token exchange, `auth._capture_chrome_linkedin_cookies()` reads `li_at` / `JSESSIONID` from Chrome's cookie store via `browser_cookie3`, then seeds a headless profile with them (`auth._init_headless_profile`). This path needs Keychain access to Chrome Safe Storage on macOS; if that is refused the user is pointed at `refresh_web_session` / `set_web_session`.
+
+### 2a. The profile is the source of truth for the session
+
+- `server._get_voyager_client()` recovers a missing web session from the profile automatically (`auth.harvest_session_from_profile`) and persists it, so a login that happened inside the window is never lost.
+- The `refresh_web_session` tool re-reads the profile on demand (JSESSIONID rotation, cleared keychain entry). `scripts/recover_voyager_session.py` does the same without the server.
+- `VoyagerClient._ensure_context()` injects the stored cookies **only when the profile has no `li_at` of its own**; the login-redirect retry in `_browser_request()` re-injects if the profile's session turns out to be stale.
+- Chromium locks a profile directory. Anything that opens it (`authenticate`, `refresh_web_session`, `set_web_session` validation, recovery) first calls `_invalidate_voyager(alias)` to close the live singleton.
 
 ### 3. Credentials are stored in the OS keychain
 
@@ -56,13 +63,14 @@ mcp/
 └── tests/
     ├── conftest.py              # File isolation fixtures
     ├── test_auth_csrf.py        # OAuth CSRF state validation
-    ├── test_auth_flow.py        # OAuth flow: system browser path, cookie capture
+    ├── test_auth_flow.py        # OAuth flow: strategy selection, Playwright login, harvest, callback server
     ├── test_cache.py            # SimpleCache TTL logic
     ├── test_client_version.py   # LinkedIn-Version header
     ├── test_connection_pool.py  # httpx connection reuse
     ├── test_keyring.py          # Keychain + file fallback for all credential types
     ├── test_playwright_pool.py  # VoyagerClient singleton + Playwright lifecycle
     ├── test_retry.py            # HTTP 429/503 retry with backoff
+    ├── test_session_recovery.py # Session recovery from the profile, refresh_web_session
     └── test_users.py            # User registry (alias management)
 ```
 
@@ -119,7 +127,7 @@ This checks:
 1. Python version
 2. Required packages (httpx, mcp, keyring, playwright, browser_cookie3)
 3. Chrome availability
-4. Playwright Chromium launch
+4. Playwright Chromium launch **and whether it can reach linkedin.com** (which decides the auth path)
 5. App credentials (keychain / env vars)
 6. Auth state for all registered aliases
 7. Log file location
@@ -131,9 +139,10 @@ This checks:
 - Check that no other process is using port 8919: `lsof -i :8919`
 - LinkedIn may have changed the OAuth redirect flow; check `~/.linkedin_mcp.log` for details
 
-**`authenticate` returns "Chrome not found"**
-- Install Chrome at `/Applications/Google Chrome.app`
-- Or set the web session manually after OAuth: `set_web_session(li_at=..., jsessionid=...)`
+**`authenticate` says the web session was not captured**
+- If a Playwright window opened and you logged in: run `refresh_web_session` (reads the profile again).
+- If no window opened: `python scripts/diagnose.py` shows whether Playwright Chromium can reach linkedin.com. Install it with `playwright install chromium`, or check the firewall. `LINKEDIN_AUTH_MODE=playwright` forces the window and surfaces the launch error.
+- On the system-browser fallback, "Unable to get key for cookie decryption" means macOS refused Keychain access to Chrome Safe Storage. Prefer fixing the Playwright path; `set_web_session` is the last resort.
 
 **Voyager tools fail with "No persistent browser profile"**
 - Re-run `authenticate` to create the Playwright profile

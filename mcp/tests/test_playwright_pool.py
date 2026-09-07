@@ -198,3 +198,25 @@ class TestScrapeMethodsUsePersistentPage:
         vc = _make_vc()
         vc._browser_scrape_profile("alice")
         mock_playwright["chromium"].launch_persistent_context.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Cookie injection policy at launch
+# ---------------------------------------------------------------------------
+
+class TestLaunchCookiePolicy:
+    def test_injects_saved_cookies_when_profile_has_no_session(self, mock_playwright):
+        mock_playwright["context"].cookies.return_value = [{"name": "JSESSIONID", "value": "j"}]
+        vc = _make_vc()
+        vc._ensure_context()
+        mock_playwright["context"].add_cookies.assert_called_once()
+
+    def test_keeps_profile_session_when_li_at_already_present(self, mock_playwright):
+        """A login done inside the Playwright window must not be clobbered by the stored copy."""
+        mock_playwright["context"].cookies.return_value = [
+            {"name": "li_at", "value": "fresh-from-profile"},
+            {"name": "JSESSIONID", "value": '"ajax:1"'},
+        ]
+        vc = _make_vc()
+        vc._ensure_context()
+        mock_playwright["context"].add_cookies.assert_not_called()

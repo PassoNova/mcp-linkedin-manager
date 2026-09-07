@@ -15,6 +15,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cla
 | `check_auth` | Show active user's token status, capability tier, scopes, and keychain status |
 | `switch_user` | Set the active LinkedIn account by alias |
 | `list_users` | List all registered aliases with their auth status and tier |
+| `refresh_web_session` | Re-read the LinkedIn session from the persistent browser profile (no browser interaction) |
 | `set_web_session` | Manually store `li_at` + `JSESSIONID` cookies for the active account |
 | `clear_web_session` | Remove browser session cookies for the active account |
 | `clear_credentials` | Remove shared app credentials (Client ID + Secret) from the OS keychain |
@@ -65,7 +66,7 @@ Each alias has its own tier:
 | `OAUTH` | Valid OAuth token | All standard tools |
 | `VOYAGER` | OAuth token + browser session | All tools, including full profile, notifications, and conversations |
 
-The Voyager tier uses the same internal API as LinkedIn's web app (`li_at` + `JSESSIONID` cookies). It is captured automatically during `authenticate` if Playwright can extract the cookies, or you can set it manually with `set_web_session`.
+The Voyager tier uses the same internal API as LinkedIn's web app (`li_at` + `JSESSIONID` cookies). `authenticate` opens the LinkedIn login in a Playwright window on a per-account browser profile and reads the session from that profile once you approve the app, so no cookie copying is needed. If Playwright's Chromium cannot reach the network, the flow falls back to your system browser and Chrome's cookie store. `refresh_web_session` re-reads the profile at any time; `set_web_session` remains as a manual last resort. Set `LINKEDIN_AUTH_MODE=playwright|browser` to force one path.
 
 ---
 
@@ -178,7 +179,7 @@ Once connected, tell Claude:
 Authenticate my LinkedIn account — use the alias "work"
 ```
 
-Claude calls `authenticate("work")`, opens your browser to LinkedIn's authorization page, and saves the token under the `work` alias. The alias becomes the active account. Playwright captures the Voyager session automatically if available.
+Claude calls `authenticate("work")`. A browser window opens on LinkedIn's authorization page; log in and approve the app there. The token is saved under the `work` alias, the alias becomes the active account, and the Voyager session is read from that window's browser profile automatically.
 
 To add a second account:
 
@@ -192,7 +193,7 @@ Then switch between them:
 Switch to my personal account
 ```
 
-If the Voyager session was not captured automatically, set it manually:
+If `check_auth` shows `tier: OAUTH` after you logged in inside the window, ask Claude to run `refresh_web_session`. Only if that fails, set the session manually:
 
 1. Open [linkedin.com](https://www.linkedin.com) in your browser (must be logged in).
 2. Open DevTools → **Application** (Chrome) or **Storage** (Firefox) → Cookies → `https://www.linkedin.com`.
