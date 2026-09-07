@@ -360,23 +360,23 @@ def _wait_for_code(
     expected_state: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """
-    Start a loopback HTTP server, wait up to *timeout* seconds for the OAuth
-    callback, then shut down. Returns (code, error).
+    Serve the loopback OAuth callback until a code or error arrives, or until
+    *timeout* seconds have passed. Returns (code, error).
+
+    Requests that carry neither ``code`` nor ``error`` (a favicon probe, a
+    stray hit on /callback) are answered and ignored; they do not end the
+    wait. The server is closed deterministically on every exit path, so no
+    thread is left blocked in handle_request().
     """
-    server = _OAuthCallbackServer(port, expected_state)
-
-    def _serve() -> None:
-        server.handle_request()
-
-    t = Thread(target=_serve, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
+    callback = _CallbackServer(port, expected_state)
+    callback.start()
     try:
-        server.server_close()
-    except Exception:
-        pass
-
-    return server.auth_code, server.error
+        deadline = time.monotonic() + timeout
+        while not callback.done and time.monotonic() < deadline:
+            time.sleep(0.1)
+    finally:
+        callback.close()
+    return callback.code, callback.error
 
 
 # ── Public helpers ─────────────────────────────────────────────────────────────
@@ -670,7 +670,7 @@ class _CallbackServer:
     to 127.0.0.1 only and keeps its state on its own server instance.
     """
 
-    def __init__(self, port: int, expected_state: str) -> None:
+    def __init__(self, port: int, expected_state: Optional[str]) -> None:
         self._server = _OAuthCallbackServer(port, expected_state)
         self._server.timeout = 0.5  # makes handle_request() return periodically
         self._stop = False
@@ -696,7 +696,10 @@ class _CallbackServer:
         return self._server.done
 
     def close(self) -> None:
+        """Stop serving and release the socket; returns once the thread has exited."""
         self._stop = True
+        if self._thread.is_alive():
+            self._thread.join(timeout=2)
         try:
             self._server.server_close()
         except Exception:

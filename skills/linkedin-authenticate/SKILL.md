@@ -34,7 +34,7 @@ happens:
    Chromium cannot reach the network, the system browser is used instead.
 2. A local callback server on port 8919 receives the OAuth redirect
 3. User approves → token exchanged (valid ~60 days), saved to keychain as `oauth_token:<alias>`
-4. Browser session cookies (`li_at`, `jsessionid`) are read from that browser
+4. Browser session cookies (`li_at`, `JSESSIONID`) are read from that browser
    profile → saved as `session:<alias>` → Voyager tier unlocked automatically
 5. The alias is registered and set as the active account
 

@@ -11,6 +11,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from unittest.mock import MagicMock
 
@@ -136,3 +137,36 @@ class TestOAuthCallbackServer:
         threading.Thread(target=fire, daemon=True).start()
         code, err = _wait_for_code(port, timeout=5, expected_state="st")
         assert (code, err) == ("zzz", None)
+
+
+class TestWaitForCodeDeterminism:
+    def test_stray_request_does_not_end_the_wait(self):
+        """A request without code/error is answered but the wait continues to the real callback."""
+        from auth import _wait_for_code
+        port = _free_port()
+
+        def fire():
+            for _ in range(50):
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico", timeout=2).close()
+                except urllib.error.HTTPError:
+                    break  # 400 answered: server is up
+                except Exception:
+                    time.sleep(0.05)
+            time.sleep(0.2)
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/callback?code=real&state=st", timeout=2).close()
+
+        threading.Thread(target=fire, daemon=True).start()
+        code, err = _wait_for_code(port, timeout=5, expected_state="st")
+        assert (code, err) == ("real", None)
+
+    def test_timeout_releases_the_port(self):
+        """After a timeout no thread stays blocked and the port can be bound again immediately."""
+        from auth import _wait_for_code, _OAuthCallbackServer
+        port = _free_port()
+        before = threading.active_count()
+        code, err = _wait_for_code(port, timeout=1, expected_state="st")
+        assert (code, err) == (None, None)
+        assert threading.active_count() <= before
+        srv = _OAuthCallbackServer(port, "st")  # would raise if the socket were still held
+        srv.server_close()
