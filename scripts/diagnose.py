@@ -95,7 +95,7 @@ def check_playwright() -> bool:
         print(f"  {WARN} Playwright not installed. The login window and Voyager tools will be unavailable;")
         print("        `authenticate` will use the system browser instead.")
         print("        Install with: pip install playwright && playwright install chromium")
-        return False
+        return True  # optional component: warn, do not fail the diagnostics
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -120,7 +120,7 @@ def check_playwright() -> bool:
     mode = resolve_auth_mode()
     chosen = "Playwright login window" if (mode == "playwright" or (mode == "auto" and err is None)) else "system browser"
     print(f"  {PASS} LINKEDIN_AUTH_MODE={mode} → authenticate will use: {chosen}")
-    return err is None
+    return True  # the probe result only selects the auth path; the fallback still works
 
 
 def check_credentials() -> bool:

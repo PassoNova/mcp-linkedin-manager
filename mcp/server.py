@@ -66,7 +66,6 @@ from auth import (
     load_user_registry,
     load_web_session,
     register_alias,
-    resolve_auth_mode,
     run_oauth_flow,
     save_credentials,
     save_token,

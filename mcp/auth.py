@@ -292,33 +292,53 @@ _ERROR_PAGE = """<!DOCTYPE html>
 
 # ── Local callback server ──────────────────────────────────────────────────────
 
-class _CallbackHandler(BaseHTTPRequestHandler):
-    """One-shot HTTP handler that captures the OAuth authorization code."""
+class _OAuthCallbackServer(HTTPServer):
+    """Loopback-only HTTP server that owns the state of one OAuth callback.
 
-    auth_code: Optional[str] = None
-    error: Optional[str] = None
-    expected_state: Optional[str] = None
+    State lives on the server instance, not on the handler class, so two
+    concurrent flows (different ports) can never clobber each other's code,
+    error, or expected CSRF state.
+    """
+
+    allow_reuse_address = True
+
+    def __init__(self, port: int, expected_state: Optional[str]) -> None:
+        super().__init__(("127.0.0.1", port), _CallbackHandler)
+        self.expected_state = expected_state
+        self.auth_code: Optional[str] = None
+        self.error: Optional[str] = None
+
+    @property
+    def done(self) -> bool:
+        return self.auth_code is not None or self.error is not None
+
+
+class _CallbackHandler(BaseHTTPRequestHandler):
+    """One-shot HTTP handler that records the OAuth authorization code on its server."""
+
+    server: _OAuthCallbackServer  # type: ignore[assignment]
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+        srv = self.server
 
         received_state = params.get("state", [None])[0]
 
         if "code" in params:
-            if _CallbackHandler.expected_state and received_state != _CallbackHandler.expected_state:
-                _CallbackHandler.error = (
+            if srv.expected_state and received_state != srv.expected_state:
+                srv.error = (
                     f"State mismatch in OAuth callback — possible CSRF attempt. "
-                    f"Expected {_CallbackHandler.expected_state!r}, got {received_state!r}."
+                    f"Expected {srv.expected_state!r}, got {received_state!r}."
                 )
                 body = _ERROR_PAGE.encode()
                 self.send_response(400)
             else:
-                _CallbackHandler.auth_code = params["code"][0]
+                srv.auth_code = params["code"][0]
                 body = _SUCCESS_PAGE.encode()
                 self.send_response(200)
         elif "error" in params:
-            _CallbackHandler.error = params.get("error_description", params.get("error", ["Unknown error"]))[0]
+            srv.error = params.get("error_description", params.get("error", ["Unknown error"]))[0]
             body = _ERROR_PAGE.encode()
             self.send_response(400)
         else:
@@ -340,14 +360,10 @@ def _wait_for_code(
     expected_state: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """
-    Start a local HTTP server, wait up to *timeout* seconds for the OAuth
+    Start a loopback HTTP server, wait up to *timeout* seconds for the OAuth
     callback, then shut down. Returns (code, error).
     """
-    _CallbackHandler.auth_code = None
-    _CallbackHandler.error = None
-    _CallbackHandler.expected_state = expected_state
-
-    server = HTTPServer(("", port), _CallbackHandler)
+    server = _OAuthCallbackServer(port, expected_state)
 
     def _serve() -> None:
         server.handle_request()
@@ -355,8 +371,12 @@ def _wait_for_code(
     t = Thread(target=_serve, daemon=True)
     t.start()
     t.join(timeout=timeout)
+    try:
+        server.server_close()
+    except Exception:
+        pass
 
-    return _CallbackHandler.auth_code, _CallbackHandler.error
+    return server.auth_code, server.error
 
 
 # ── Public helpers ─────────────────────────────────────────────────────────────
@@ -646,14 +666,12 @@ class _CallbackServer:
     """Serve the OAuth callback on a background thread until a result arrives.
 
     Unlike _wait_for_code(), this does not block the caller, so the caller can
-    drive a browser window and watch for it being closed while it waits.
+    drive a browser window and watch for it being closed while it waits. Binds
+    to 127.0.0.1 only and keeps its state on its own server instance.
     """
 
     def __init__(self, port: int, expected_state: str) -> None:
-        _CallbackHandler.auth_code = None
-        _CallbackHandler.error = None
-        _CallbackHandler.expected_state = expected_state
-        self._server = HTTPServer(("", port), _CallbackHandler)
+        self._server = _OAuthCallbackServer(port, expected_state)
         self._server.timeout = 0.5  # makes handle_request() return periodically
         self._stop = False
         self._thread = Thread(target=self._serve, daemon=True)
@@ -667,15 +685,15 @@ class _CallbackServer:
 
     @property
     def code(self) -> Optional[str]:
-        return _CallbackHandler.auth_code
+        return self._server.auth_code
 
     @property
     def error(self) -> Optional[str]:
-        return _CallbackHandler.error
+        return self._server.error
 
     @property
     def done(self) -> bool:
-        return self.code is not None or self.error is not None
+        return self._server.done
 
     def close(self) -> None:
         self._stop = True

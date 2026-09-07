@@ -1,27 +1,35 @@
-"""Tests for OAuth CSRF state validation (Phase 2)."""
+"""Tests for OAuth CSRF state validation and callback-server isolation.
+
+The callback handler records its result on the server instance it belongs to
+(_OAuthCallbackServer), never on class-level state, so concurrent flows cannot
+clobber each other. The server binds to the loopback interface only.
+"""
 from __future__ import annotations
 
+import os
+import socket
+import sys
+import threading
+import time
+import urllib.request
 from unittest.mock import MagicMock
 
 import pytest
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-def _make_handler(path: str):
-    """Return a _CallbackHandler instance wired to mock sockets, with self.path set."""
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+def _make_handler(path: str, expected_state: str | None):
+    """Return a _CallbackHandler wired to mock sockets and a fake server holding state."""
     from auth import _CallbackHandler
 
-    # BaseHTTPRequestHandler.__init__ needs (request, client_address, server).
-    # We pass mocks and immediately override the attributes it would set.
     request = MagicMock()
     request.makefile.return_value = MagicMock()
     handler = _CallbackHandler.__new__(_CallbackHandler)
     handler.request = request
     handler.client_address = ("127.0.0.1", 12345)
-    handler.server = MagicMock()
+    handler.server = MagicMock(expected_state=expected_state, auth_code=None, error=None)
     handler.path = path
-    # Mock the response-writing methods so they're no-ops.
     handler.send_response = MagicMock()
     handler.send_header = MagicMock()
     handler.end_headers = MagicMock()
@@ -29,89 +37,102 @@ def _make_handler(path: str):
     return handler
 
 
-@pytest.fixture(autouse=True)
-def _reset_handler():
-    """Reset _CallbackHandler class vars before each test."""
-    from auth import _CallbackHandler
-    _CallbackHandler.auth_code = None
-    _CallbackHandler.error = None
-    _CallbackHandler.expected_state = None
-    yield
-    _CallbackHandler.auth_code = None
-    _CallbackHandler.error = None
-    _CallbackHandler.expected_state = None
-
-
 class TestCallbackHandlerCSRF:
     def test_valid_state_sets_auth_code(self):
-        from auth import _CallbackHandler
-        _CallbackHandler.expected_state = "abc123"
-        handler = _make_handler("/callback?code=mycode&state=abc123")
-        handler.do_GET()
-        assert _CallbackHandler.auth_code == "mycode"
-        assert _CallbackHandler.error is None
+        h = _make_handler("/callback?code=mycode&state=abc123", "abc123")
+        h.do_GET()
+        assert h.server.auth_code == "mycode"
+        assert h.server.error is None
+        h.send_response.assert_called_once_with(200)
 
     def test_state_mismatch_sets_error_not_code(self):
-        from auth import _CallbackHandler
-        _CallbackHandler.expected_state = "abc123"
-        handler = _make_handler("/callback?code=mycode&state=WRONG")
-        handler.do_GET()
-        assert _CallbackHandler.auth_code is None
-        assert _CallbackHandler.error is not None
-        assert "mismatch" in _CallbackHandler.error.lower()
+        h = _make_handler("/callback?code=mycode&state=WRONG", "abc123")
+        h.do_GET()
+        assert h.server.auth_code is None
+        assert "mismatch" in h.server.error.lower()
+        h.send_response.assert_called_once_with(400)
 
     def test_missing_state_treated_as_mismatch(self):
-        from auth import _CallbackHandler
-        _CallbackHandler.expected_state = "abc123"
-        handler = _make_handler("/callback?code=mycode")  # no state param
-        handler.do_GET()
-        assert _CallbackHandler.auth_code is None
-        assert _CallbackHandler.error is not None
+        h = _make_handler("/callback?code=mycode", "abc123")
+        h.do_GET()
+        assert h.server.auth_code is None
+        assert h.server.error is not None
 
     def test_no_expected_state_skips_validation(self):
-        """If expected_state is None (e.g. legacy path), any state is accepted."""
-        from auth import _CallbackHandler
-        _CallbackHandler.expected_state = None
-        handler = _make_handler("/callback?code=mycode&state=anything")
-        handler.do_GET()
-        assert _CallbackHandler.auth_code == "mycode"
-        assert _CallbackHandler.error is None
+        """If expected_state is None (legacy path), any state is accepted."""
+        h = _make_handler("/callback?code=mycode&state=anything", None)
+        h.do_GET()
+        assert h.server.auth_code == "mycode"
+        assert h.server.error is None
 
     def test_error_param_always_sets_error(self):
-        from auth import _CallbackHandler
-        _CallbackHandler.expected_state = "abc123"
-        handler = _make_handler("/callback?error=access_denied&error_description=User+denied")
-        handler.do_GET()
-        assert _CallbackHandler.auth_code is None
-        assert "User denied" in (_CallbackHandler.error or "")
+        h = _make_handler("/callback?error=access_denied&error_description=User+denied", "abc123")
+        h.do_GET()
+        assert h.server.auth_code is None
+        assert h.server.error == "User denied"
+        h.send_response.assert_called_once_with(400)
 
-    def test_send_response_400_on_mismatch(self):
-        from auth import _CallbackHandler
-        _CallbackHandler.expected_state = "abc123"
-        handler = _make_handler("/callback?code=mycode&state=WRONG")
-        handler.do_GET()
-        handler.send_response.assert_called_once_with(400)
-
-    def test_send_response_200_on_valid(self):
-        from auth import _CallbackHandler
-        _CallbackHandler.expected_state = "abc123"
-        handler = _make_handler("/callback?code=mycode&state=abc123")
-        handler.do_GET()
-        handler.send_response.assert_called_once_with(200)
+    def test_no_params_is_an_error_response_without_state_change(self):
+        h = _make_handler("/callback", "abc123")
+        h.do_GET()
+        assert h.server.auth_code is None
+        assert h.server.error is None
+        h.send_response.assert_called_once_with(400)
 
 
-class TestWaitForCodePassesState:
-    def test_expected_state_assigned_to_handler(self, monkeypatch):
-        """_wait_for_code should propagate expected_state to _CallbackHandler."""
-        from auth import _CallbackHandler
-        import auth
+# ── Server-instance isolation and loopback binding ────────────────────────────
 
-        # Patch HTTPServer and Thread so nothing actually listens.
-        mock_server = MagicMock()
-        mock_thread = MagicMock()
-        monkeypatch.setattr(auth, "HTTPServer", lambda *a, **kw: mock_server)
-        monkeypatch.setattr(auth, "Thread", lambda **kw: mock_thread)
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
-        auth._wait_for_code(port=9999, timeout=1, expected_state="state-xyz")
 
-        assert _CallbackHandler.expected_state == "state-xyz"
+class TestOAuthCallbackServer:
+    def test_binds_to_loopback_only(self):
+        from auth import _OAuthCallbackServer
+        srv = _OAuthCallbackServer(_free_port(), "s")
+        try:
+            assert srv.server_address[0] == "127.0.0.1"
+        finally:
+            srv.server_close()
+
+    def test_two_servers_keep_independent_state(self):
+        """Two concurrent flows must not share code/error/expected_state."""
+        from auth import _OAuthCallbackServer
+        a = _OAuthCallbackServer(_free_port(), "state-a")
+        b = _OAuthCallbackServer(_free_port(), "state-b")
+        try:
+            ta = threading.Thread(target=a.handle_request, daemon=True)
+            tb = threading.Thread(target=b.handle_request, daemon=True)
+            ta.start()
+            tb.start()
+            pa, pb = a.server_address[1], b.server_address[1]
+            urllib.request.urlopen(f"http://127.0.0.1:{pa}/callback?code=code-a&state=state-a", timeout=5).close()
+            with pytest.raises(urllib.error.HTTPError):
+                urllib.request.urlopen(f"http://127.0.0.1:{pb}/callback?code=code-b&state=state-a", timeout=5)
+            ta.join(3)
+            tb.join(3)
+            assert (a.auth_code, a.error) == ("code-a", None)
+            assert b.auth_code is None
+            assert "mismatch" in b.error.lower()
+            assert a.expected_state == "state-a" and b.expected_state == "state-b"
+        finally:
+            a.server_close()
+            b.server_close()
+
+    def test_wait_for_code_returns_result_from_its_own_server(self):
+        from auth import _wait_for_code
+        port = _free_port()
+
+        def fire():
+            for _ in range(50):
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/callback?code=zzz&state=st", timeout=2).close()
+                    return
+                except Exception:
+                    time.sleep(0.05)
+
+        threading.Thread(target=fire, daemon=True).start()
+        code, err = _wait_for_code(port, timeout=5, expected_state="st")
+        assert (code, err) == ("zzz", None)
