@@ -7,17 +7,23 @@ Handles the full authorization code flow:
   3. Exchange the authorization code for an access token
   4. Persist the token to disk / OS keychain for future requests
 
-Design decision: OAuth always uses the system browser (Chrome preferred, then
-default browser). Playwright's bundled Chromium is NOT used for the auth flow —
-it is unreliable in MCP server environments where macOS Application Firewall or
-security tooling may block the binary's outbound network connections.
+Design decision: the login happens inside a *headed* Playwright window on the
+per-alias persistent profile whenever Playwright's Chromium can reach
+linkedin.com (checked with a short headless probe first). The Voyager session
+cookies are then read straight from that profile — the same profile
+VoyagerClient reuses headlessly — so no Chrome cookie-store decryption and no
+OS-keychain access is needed, and the cookies match the browser fingerprint
+LinkedIn saw at login.
 
-Playwright is used only for the optional Voyager profile initialization step,
-which runs headlessly after authentication with valid cookies already set.
+If the probe fails (macOS Application Firewall, Little Snitch, no Playwright
+Chromium installed) the flow falls back to the system browser + local callback
+server, followed by best-effort capture from Chrome's cookie store. Set
+LINKEDIN_AUTH_MODE=playwright|browser to force one path.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -26,16 +32,18 @@ import secrets
 import time
 import urllib.parse
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import httpx
 
 try:
-    from playwright.async_api import async_playwright
+    from playwright.sync_api import sync_playwright as _sync_playwright
     _PLAYWRIGHT_AVAILABLE = True
 except ImportError:
+    _sync_playwright = None  # type: ignore[assignment]
     _PLAYWRIGHT_AVAILABLE = False
 
 try:
@@ -446,61 +454,319 @@ def _open_in_chrome(url: str) -> bool:
         return False
 
 
-async def _init_headless_profile(
+# ── Auth flow configuration ────────────────────────────────────────────────────
+
+# auto       — Playwright login window when its Chromium can reach linkedin.com,
+#              otherwise the system browser (Chrome preferred).
+# playwright — always use the Playwright login window (error if unavailable).
+# browser    — always use the system browser + Chrome cookie-store capture.
+AUTH_MODE = os.environ.get("LINKEDIN_AUTH_MODE", "auto").strip().lower()
+AUTH_MODES = ("auto", "playwright", "browser")
+
+# Seconds to wait for the user to finish logging in / approving the app.
+AUTH_TIMEOUT = int(os.environ.get("LINKEDIN_AUTH_TIMEOUT", "300"))
+
+# Milliseconds for the headless network probe and initial page loads.
+PROBE_TIMEOUT_MS = int(os.environ.get("LINKEDIN_PROBE_TIMEOUT_MS", "15000"))
+
+_LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
+_FEED_URL = "https://www.linkedin.com/feed/"
+
+
+class OAuthResult(NamedTuple):
+    """Outcome of run_oauth_flow()."""
+
+    token_data: dict
+    li_at: Optional[str]
+    jsessionid: Optional[str]
+    session_error: Optional[str]
+    method: str  # "playwright" | "browser"
+
+
+class PlaywrightLoginUnavailable(RuntimeError):
+    """Raised when the Playwright login window cannot even be opened.
+
+    Distinct from user-side failures (timeout, closed window, denied consent) so
+    the caller can fall back to the system browser *only* when the user never
+    got a chance to interact.
+    """
+
+
+def _cookies_from_list(cookies: list[dict]) -> tuple[Optional[str], Optional[str]]:
+    """Extract (li_at, JSESSIONID) values from a Playwright cookie list."""
+    li_at = next((c["value"] for c in cookies if c.get("name") == "li_at"), None)
+    jsessionid = next((c["value"] for c in cookies if c.get("name") == "JSESSIONID"), None)
+    return li_at, jsessionid
+
+
+def _run_in_thread(fn, *args, **kwargs):
+    """Run *fn* on a fresh thread and return its result.
+
+    Playwright's sync API refuses to run inside a thread that owns an asyncio
+    loop (the MCP server's tool-dispatch thread). Every Playwright helper in
+    this module is synchronous and is invoked through this shim.
+    """
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(fn, *args, **kwargs).result()
+
+
+# ── Playwright helpers (sync API; call via _run_in_thread from async code) ─────
+
+def probe_playwright_network(timeout_ms: int = PROBE_TIMEOUT_MS) -> Optional[str]:
+    """Return None if Playwright's Chromium can reach linkedin.com, else why not.
+
+    Any HTTP response counts as reachable (LinkedIn may answer a headless
+    request with 999 or a redirect; that is still a working network path).
+    Only launch failures and network-level errors count as unreachable — those
+    are the cases where the macOS Application Firewall or tools like Little
+    Snitch block the bundled Chromium binary.
+    """
+    if not _PLAYWRIGHT_AVAILABLE:
+        return "playwright not installed"
+    try:
+        with _sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+            try:
+                page = browser.new_page()
+                page.goto(
+                    "https://www.linkedin.com/",
+                    wait_until="domcontentloaded",
+                    timeout=timeout_ms,
+                )
+            finally:
+                browser.close()
+        _log.debug("Playwright network probe: linkedin.com reachable")
+        return None
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}".splitlines()[0][:200]
+        _log.warning("Playwright network probe failed: %s", msg)
+        return msg
+
+
+def _harvest_session(context) -> tuple[Optional[str], Optional[str]]:
+    """Read li_at / JSESSIONID from a live Playwright context.
+
+    If li_at is present but JSESSIONID is not, visit /feed/ once so LinkedIn
+    issues it. Never navigates when there is no li_at (nothing to refresh).
+    """
+    li_at, jsessionid = _cookies_from_list(context.cookies("https://www.linkedin.com"))
+    if li_at and not jsessionid:
+        page = context.new_page()
+        try:
+            page.goto(_FEED_URL, wait_until="domcontentloaded", timeout=PROBE_TIMEOUT_MS)
+        except Exception as nav_err:
+            _log.debug("Feed navigation while harvesting session: %s (non-fatal)", nav_err)
+        finally:
+            page.close()
+        li_at, jsessionid = _cookies_from_list(context.cookies("https://www.linkedin.com"))
+    return li_at, jsessionid
+
+
+def harvest_session_from_profile(
+    browser_dir: str,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Open the persistent profile headlessly and read the LinkedIn session.
+
+    Returns (li_at, jsessionid, error). error is None on success. This is the
+    recovery path: once a login has happened inside the Playwright profile,
+    the cookies can be re-read at any time without touching Chrome or the
+    OS keychain. The profile must not be open elsewhere (Chromium locks it),
+    so callers close any live VoyagerClient for the alias first.
+    """
+    if not _PLAYWRIGHT_AVAILABLE:
+        return None, None, "playwright not installed"
+    if not has_browser_profile(browser_dir):
+        return None, None, "no browser profile — run `authenticate` first"
+    try:
+        with _sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                browser_dir, headless=True, args=_LAUNCH_ARGS
+            )
+            try:
+                li_at, jsessionid = _harvest_session(context)
+            finally:
+                context.close()
+    except Exception as exc:
+        _log.warning("Session harvest from profile failed: %s", exc)
+        return None, None, f"profile read failed: {exc}"
+    if not li_at:
+        return None, None, "no LinkedIn session in the browser profile (expired or never logged in)"
+    _log.info("Harvested LinkedIn session from profile %s", browser_dir)
+    return li_at, jsessionid, None
+
+
+def _init_headless_profile(
     li_at: str,
-    jsessionid: str,
+    jsessionid: Optional[str],
     browser_dir: str,
 ) -> tuple[Optional[str], Optional[str]]:
-    """
-    Seed a headless Playwright profile with cookies captured from Chrome.
+    """Seed a headless Playwright profile with cookies captured from Chrome.
 
-    Injects li_at (and JSESSIONID if present), navigates to linkedin.com/feed/
-    so LinkedIn issues/refreshes JSESSIONID. The resulting persistent profile is
-    what VoyagerClient reuses for every subsequent API call.
+    Used only on the system-browser path. Injects li_at (and JSESSIONID if
+    present), visits /feed/ so LinkedIn issues or refreshes JSESSIONID, and
+    leaves a persistent profile behind for VoyagerClient.
 
-    Returns (jsessionid_final, error_message). error_message is None on success.
-    On failure the original jsessionid is returned unchanged.
+    Returns (jsessionid_final, error_message). On failure the original
+    jsessionid is returned unchanged.
     """
     try:
         _log.debug("Initializing Playwright headless profile at %s", browser_dir)
-        async with async_playwright() as p:
-            os.makedirs(browser_dir, exist_ok=True)
-            context = await p.chromium.launch_persistent_context(
-                browser_dir,
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
+        os.makedirs(browser_dir, exist_ok=True)
+        with _sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                browser_dir, headless=True, args=_LAUNCH_ARGS
             )
-            cookies: list[dict] = [
-                {"name": "li_at", "value": li_at, "domain": ".linkedin.com", "path": "/"},
-            ]
-            if jsessionid:
-                cookies.append(
-                    {"name": "JSESSIONID", "value": jsessionid, "domain": ".linkedin.com", "path": "/"}
-                )
-            await context.add_cookies(cookies)
-
-            page = await context.new_page()
             try:
-                await page.goto(
-                    "https://www.linkedin.com/feed/",
-                    wait_until="domcontentloaded",
-                    timeout=15_000,
-                )
-            except Exception as nav_err:
-                _log.debug("Feed navigation during profile init: %s (non-fatal)", nav_err)
-
-            live_cookies = await context.cookies("https://www.linkedin.com")
-            jsessionid_final = next(
-                (c["value"] for c in live_cookies if c["name"] == "JSESSIONID"),
-                jsessionid,
-            )
-            await context.close()
+                cookies: list[dict] = [
+                    {"name": "li_at", "value": li_at, "domain": ".linkedin.com", "path": "/"},
+                ]
+                if jsessionid:
+                    cookies.append(
+                        {"name": "JSESSIONID", "value": jsessionid, "domain": ".linkedin.com", "path": "/"}
+                    )
+                context.add_cookies(cookies)
+                page = context.new_page()
+                try:
+                    page.goto(_FEED_URL, wait_until="domcontentloaded", timeout=PROBE_TIMEOUT_MS)
+                except Exception as nav_err:
+                    _log.debug("Feed navigation during profile init: %s (non-fatal)", nav_err)
+                _, jsessionid_final = _cookies_from_list(context.cookies("https://www.linkedin.com"))
+            finally:
+                context.close()
         _log.info("Playwright headless profile initialized at %s", browser_dir)
-        return jsessionid_final, None
+        return jsessionid_final or jsessionid, None
     except Exception as exc:
         _log.warning("Headless profile init failed: %s", exc)
         return jsessionid, f"headless profile init failed: {exc}"
 
+
+# ── Local callback server, pollable (used by the Playwright login path) ────────
+
+class _CallbackServer:
+    """Serve the OAuth callback on a background thread until a result arrives.
+
+    Unlike _wait_for_code(), this does not block the caller, so the caller can
+    drive a browser window and watch for it being closed while it waits.
+    """
+
+    def __init__(self, port: int, expected_state: str) -> None:
+        _CallbackHandler.auth_code = None
+        _CallbackHandler.error = None
+        _CallbackHandler.expected_state = expected_state
+        self._server = HTTPServer(("", port), _CallbackHandler)
+        self._server.timeout = 0.5  # makes handle_request() return periodically
+        self._stop = False
+        self._thread = Thread(target=self._serve, daemon=True)
+
+    def _serve(self) -> None:
+        while not self._stop and not self.done:
+            self._server.handle_request()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    @property
+    def code(self) -> Optional[str]:
+        return _CallbackHandler.auth_code
+
+    @property
+    def error(self) -> Optional[str]:
+        return _CallbackHandler.error
+
+    @property
+    def done(self) -> bool:
+        return self.code is not None or self.error is not None
+
+    def close(self) -> None:
+        self._stop = True
+        try:
+            self._server.server_close()
+        except Exception:
+            pass
+
+
+# ── OAuth flow: Playwright login window ────────────────────────────────────────
+
+def _run_oauth_flow_playwright(
+    client_id: str,
+    client_secret: str,
+    port: int,
+    browser_dir: str,
+    timeout: int = AUTH_TIMEOUT,
+) -> tuple[dict, Optional[str], Optional[str]]:
+    """OAuth flow driven by a *headed* Playwright window on the persistent profile.
+
+    The user logs in and approves the app inside that window. Because the
+    session is created in the same Chromium profile VoyagerClient later reuses
+    headlessly, the cookies match the fingerprint LinkedIn saw at login —
+    no Chrome cookie store, no OS keychain decryption, no cookie injection.
+
+    Returns (token_data, li_at, jsessionid).
+
+    Raises PlaywrightLoginUnavailable if the window could not be opened or
+    the authorization page could not load (caller may fall back). Raises
+    RuntimeError for timeouts, a closed window, or a denied authorization.
+    """
+    redirect_uri = f"http://localhost:{port}/callback"
+    state = secrets.token_urlsafe(16)
+    auth_url = build_auth_url(client_id, redirect_uri, state)
+    os.makedirs(browser_dir, exist_ok=True)
+
+    callback = _CallbackServer(port, state)
+    callback.start()
+    _log.info("Starting OAuth flow — opening Playwright login window (profile %s)", browser_dir)
+    try:
+        with _sync_playwright() as p:
+            try:
+                context = p.chromium.launch_persistent_context(
+                    browser_dir, headless=False, args=_LAUNCH_ARGS
+                )
+            except Exception as exc:
+                raise PlaywrightLoginUnavailable(f"could not launch Chromium: {exc}") from exc
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                try:
+                    page.goto(auth_url, wait_until="domcontentloaded", timeout=PROBE_TIMEOUT_MS)
+                except Exception as exc:
+                    raise PlaywrightLoginUnavailable(
+                        f"authorization page did not load: {exc}"
+                    ) from exc
+
+                deadline = time.monotonic() + timeout
+                while not callback.done:
+                    if time.monotonic() > deadline:
+                        _log.error("OAuth callback timed out after %ds", timeout)
+                        raise RuntimeError(
+                            "Timed out waiting for LinkedIn authorization. Please try again."
+                        )
+                    if not context.pages:
+                        _log.error("Login window closed before authorization completed")
+                        raise RuntimeError(
+                            "The login window was closed before authorization completed."
+                        )
+                    time.sleep(0.5)
+
+                if callback.error:
+                    _log.error("OAuth callback error: %s", callback.error)
+                    raise RuntimeError(f"LinkedIn authorization failed: {callback.error}")
+
+                li_at, jsessionid = _harvest_session(context)
+            finally:
+                context.close()
+    finally:
+        callback.close()
+
+    _log.info("Authorization code received; exchanging for token")
+    token_data = exchange_code(callback.code, client_id, client_secret, redirect_uri)
+    token_data["_obtained_at"] = int(time.time())
+    if li_at:
+        _log.info("Captured LinkedIn session from the Playwright login profile")
+    else:
+        _log.warning("Playwright login completed but li_at was not found in the profile")
+    return token_data, li_at, jsessionid
+
+
+# ── OAuth flow: system browser ─────────────────────────────────────────────────
 
 def _run_oauth_flow_browser(client_id: str, client_secret: str, port: int) -> tuple[dict, bool]:
     """
@@ -515,7 +781,7 @@ def _run_oauth_flow_browser(client_id: str, client_secret: str, port: int) -> tu
     state = secrets.token_urlsafe(16)
     auth_url = build_auth_url(client_id, redirect_uri, state)
 
-    _log.info("Starting OAuth flow — opening browser to LinkedIn authorization page")
+    _log.info("Starting OAuth flow — opening system browser to LinkedIn authorization page")
     opened_via_chrome = _open_in_chrome(auth_url)
     if not opened_via_chrome:
         _log.info("Chrome not found; using default browser (Voyager session capture unavailable)")
@@ -537,47 +803,116 @@ def _run_oauth_flow_browser(client_id: str, client_secret: str, port: int) -> tu
     return token_data, opened_via_chrome
 
 
-async def run_oauth_flow(
-    client_id: str,
-    client_secret: str,
-    port: int = DEFAULT_PORT,
-    browser_dir: str = DEFAULT_BROWSER_DIR,
-) -> tuple[dict, Optional[str], Optional[str], Optional[str]]:
-    """
-    Full interactive OAuth flow. Returns (token_data, li_at, jsessionid, session_error).
-
-    Always uses the system browser (Chrome preferred) with a local callback server.
-    Playwright is NOT used for the auth flow — it is unreliable in MCP server
-    environments where the OS may block Playwright's Chromium binary from
-    making outbound network connections.
-
-    After token exchange:
-      1. If Chrome was used: captures li_at / JSESSIONID from Chrome's cookie store.
-      2. If li_at captured and Playwright is available: initializes a headless
-         Playwright profile with those cookies so VoyagerClient can reuse it.
-
-    Raises RuntimeError on failure or timeout.
-    """
+def _run_oauth_flow_browser_with_capture(
+    client_id: str, client_secret: str, port: int, browser_dir: str
+) -> OAuthResult:
+    """System-browser flow followed by best-effort Chrome cookie capture."""
     token_data, opened_via_chrome = _run_oauth_flow_browser(client_id, client_secret, port)
 
     if not opened_via_chrome:
-        return (
+        return OAuthResult(
             token_data, None, None,
             "Chrome not found; Voyager session not captured. "
-            "Run `set_web_session` with cookies from your browser to enable Voyager tools."
+            "Run `set_web_session` with cookies from your browser to enable Voyager tools.",
+            "browser",
         )
 
     li_at, jsessionid, cookie_err = _capture_chrome_linkedin_cookies()
     if not li_at:
         _log.warning("Voyager session capture failed: %s", cookie_err)
-        return token_data, None, None, cookie_err
+        return OAuthResult(token_data, None, None, cookie_err, "browser")
 
     if _PLAYWRIGHT_AVAILABLE:
-        jsessionid, _ = await _init_headless_profile(li_at, jsessionid, browser_dir)
+        jsessionid, _ = _init_headless_profile(li_at, jsessionid, browser_dir)
     else:
         _log.info("Playwright not available — skipping headless profile init")
 
-    return token_data, li_at, jsessionid, None
+    return OAuthResult(token_data, li_at, jsessionid, None, "browser")
+
+
+# ── OAuth flow: entry point ────────────────────────────────────────────────────
+
+def resolve_auth_mode(mode: Optional[str] = None) -> str:
+    """Normalize the requested auth mode, defaulting to LINKEDIN_AUTH_MODE / auto."""
+    mode = (mode or AUTH_MODE or "auto").strip().lower()
+    if mode not in AUTH_MODES:
+        _log.warning("Unknown LINKEDIN_AUTH_MODE %r; using 'auto'", mode)
+        return "auto"
+    return mode
+
+
+def _run_oauth_flow_sync(
+    client_id: str,
+    client_secret: str,
+    port: int,
+    browser_dir: str,
+    mode: str,
+) -> OAuthResult:
+    if mode != "browser":
+        if not _PLAYWRIGHT_AVAILABLE:
+            if mode == "playwright":
+                raise RuntimeError(
+                    "LINKEDIN_AUTH_MODE=playwright but Playwright is not installed. "
+                    "Run `pip install playwright && playwright install chromium`."
+                )
+            _log.info("Playwright not installed; using system browser for OAuth")
+        else:
+            probe_err = probe_playwright_network() if mode == "auto" else None
+            if probe_err:
+                _log.warning(
+                    "Playwright Chromium cannot reach linkedin.com (%s); "
+                    "falling back to the system browser", probe_err,
+                )
+            else:
+                try:
+                    token_data, li_at, jsessionid = _run_oauth_flow_playwright(
+                        client_id, client_secret, port, browser_dir
+                    )
+                except PlaywrightLoginUnavailable as exc:
+                    if mode == "playwright":
+                        raise
+                    _log.warning(
+                        "Playwright login window unavailable (%s); "
+                        "falling back to the system browser", exc,
+                    )
+                else:
+                    err = (
+                        None if li_at else
+                        "login completed but no li_at cookie was found in the Playwright profile; "
+                        "run `refresh_web_session` after logging in, or `set_web_session`"
+                    )
+                    return OAuthResult(token_data, li_at, jsessionid, err, "playwright")
+
+    return _run_oauth_flow_browser_with_capture(client_id, client_secret, port, browser_dir)
+
+
+async def run_oauth_flow(
+    client_id: str,
+    client_secret: str,
+    port: int = DEFAULT_PORT,
+    browser_dir: str = DEFAULT_BROWSER_DIR,
+    mode: Optional[str] = None,
+) -> OAuthResult:
+    """
+    Full interactive OAuth flow. Returns an OAuthResult.
+
+    Strategy (mode defaults to LINKEDIN_AUTH_MODE, normally "auto"):
+      1. Playwright login window on the per-alias persistent profile, when the
+         bundled Chromium can reach linkedin.com. The Voyager session is read
+         straight from that profile after the user approves the app.
+      2. Otherwise the system browser (Chrome preferred) + local callback
+         server, followed by best-effort capture from Chrome's cookie store
+         and a headless profile seeded with those cookies.
+
+    Everything Playwright-related runs on a worker thread because its sync
+    API cannot run on the server's asyncio thread.
+
+    Raises RuntimeError on failure or timeout.
+    """
+    resolved = resolve_auth_mode(mode)
+    return await asyncio.to_thread(
+        _run_oauth_flow_sync, client_id, client_secret, port, browser_dir, resolved,
+    )
 
 
 # ── Token persistence (per-user, keyed by alias) ───────────────────────────────

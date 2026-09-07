@@ -88,24 +88,39 @@ def check_chrome() -> bool:
 
 
 def check_playwright() -> bool:
-    _section("Playwright (needed for Voyager API scraping)")
+    _section("Playwright (login window + Voyager API scraping)")
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        print(f"  {WARN} Playwright not installed. Voyager tools will be unavailable.")
+        print(f"  {WARN} Playwright not installed. The login window and Voyager tools will be unavailable;")
+        print("        `authenticate` will use the system browser instead.")
         print("        Install with: pip install playwright && playwright install chromium")
-        return True  # Warning only
-
+        return False
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             browser.close()
         print(f"  {PASS} Playwright Chromium launches successfully")
-        return True
     except Exception as exc:
         print(f"  {FAIL} Playwright Chromium launch failed: {exc}")
         print("        Try: playwright install chromium")
         return False
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "mcp"))
+    from auth import probe_playwright_network, resolve_auth_mode
+
+    err = probe_playwright_network()
+    if err is None:
+        print(f"  {PASS} Playwright Chromium can reach linkedin.com")
+    else:
+        print(f"  {WARN} Playwright Chromium cannot reach linkedin.com: {err}")
+        print("        A firewall (macOS Application Firewall, Little Snitch) may be blocking the")
+        print("        bundled Chromium. `authenticate` will fall back to the system browser and")
+        print("        Chrome cookie capture, which needs keychain access to Chrome Safe Storage.")
+    mode = resolve_auth_mode()
+    chosen = "Playwright login window" if (mode == "playwright" or (mode == "auto" and err is None)) else "system browser"
+    print(f"  {PASS} LINKEDIN_AUTH_MODE={mode} → authenticate will use: {chosen}")
+    return err is None
 
 
 def check_credentials() -> bool:

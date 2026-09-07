@@ -58,6 +58,7 @@ from auth import (
     delete_token,
     delete_web_session,
     get_active_alias,
+    harvest_session_from_profile,
     has_browser_profile,
     is_token_expired,
     load_credentials,
@@ -65,12 +66,14 @@ from auth import (
     load_user_registry,
     load_web_session,
     register_alias,
+    resolve_auth_mode,
     run_oauth_flow,
     save_credentials,
     save_token,
     save_web_session,
     set_active_alias,
     validate_alias,
+    _run_in_thread,
 )
 from client import LinkedInClient, VoyagerClient
 
@@ -171,10 +174,33 @@ _voyager_singletons: dict[str, VoyagerClient] = {}
 _voyager_session_keys: dict[str, str] = {}
 
 
+def _recover_session_from_profile(alias: str) -> Optional[dict]:
+    """Re-read the LinkedIn session from the alias's persistent Playwright profile.
+
+    Runs when no web session is saved but a profile exists (e.g. the login
+    happened inside the Playwright window but the cookies were never stored,
+    or the session entry was cleared). Persists what it finds so the next call
+    is a plain keychain read. Returns the session dict or None.
+    """
+    bdir = _browser_dir(alias)
+    if not has_browser_profile(bdir):
+        return None
+    _invalidate_voyager(alias)  # Chromium locks the profile; make sure it is free
+    _log.info("No web session for '%s'; trying to recover it from %s", alias, bdir)
+    li_at, jsessionid, err = _run_in_thread(harvest_session_from_profile, bdir)
+    if not li_at:
+        _log.info("Session recovery for '%s' failed: %s", alias, err)
+        return None
+    save_web_session(li_at, jsessionid or "", alias)
+    return load_web_session(alias)
+
+
 def _get_voyager_client(alias: Optional[str] = None) -> Optional[VoyagerClient]:
     """Return a reusable VoyagerClient for alias, creating one only when session changes."""
     alias = alias or _active_alias()
     session = load_web_session(alias)
+    if not session:
+        session = _recover_session_from_profile(alias)
     if not session:
         _log.debug("No web session for '%s'; Voyager unavailable", alias)
         return None
@@ -261,43 +287,48 @@ async def authenticate(alias: str) -> str:
         try:
             validate_alias(alias)
             client_id, client_secret = _credentials()
-
-            token_data, li_at, jsessionid, session_err = await run_oauth_flow(
-                client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
-            )
-            save_token(token_data, alias)
-            register_alias(alias)
+            # Release the persistent profile before the login window opens on it.
             _invalidate_voyager(alias)
 
-            scopes = token_data.get("scope", "unknown")
-            expires_in = token_data.get("expires_in", "unknown")
+            result = await run_oauth_flow(
+                client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
+            )
+            save_token(result.token_data, alias)
+            register_alias(alias)
 
-            if li_at:
-                save_web_session(li_at, jsessionid or "", alias)
+            scopes = result.token_data.get("scope", "unknown")
+            expires_in = result.token_data.get("expires_in", "unknown")
+            via = (
+                "Playwright login window"
+                if result.method == "playwright"
+                else "system browser + Chrome cookie store"
+            )
+
+            if result.li_at:
+                save_web_session(result.li_at, result.jsessionid or "", alias)
                 tier_note = (
                     "Voyager API enabled"
-                    if jsessionid
+                    if result.jsessionid
                     else "Voyager API enabled (JSESSIONID will be refreshed on first use)"
                 )
-                session_note = f"   Web session    : captured automatically ({tier_note})\n"
+                session_note = f"   Web session    : captured via {via} ({tier_note})\n"
                 _log.info(
-                    "Authentication complete for '%s': tier=VOYAGER scopes=%s", alias, scopes
-                )
-            elif session_err:
-                session_note = (
-                    f"   Web session    : not captured ({session_err})\n"
-                    "                    Run `set_web_session` with cookies from your browser to enable Voyager tools.\n"
-                )
-                _log.info(
-                    "Authentication complete for '%s': tier=OAUTH scopes=%s session_err=%s",
-                    alias, scopes, session_err,
+                    "Authentication complete for '%s': tier=VOYAGER method=%s scopes=%s",
+                    alias, result.method, scopes,
                 )
             else:
+                reason = result.session_error or "unknown"
                 session_note = (
-                    "   Web session    : not captured — run `authenticate` again to retry\n"
+                    f"   Web session    : not captured via {via} ({reason})\n"
+                    "                    Voyager tools are unavailable until a session exists. Options:\n"
+                    "                    - run `authenticate` again (a Playwright login window is used when its\n"
+                    "                      Chromium can reach linkedin.com; `playwright install chromium` if missing)\n"
+                    "                    - run `refresh_web_session` if you have since logged in inside that window\n"
+                    "                    - run `set_web_session` with cookies copied from your browser\n"
                 )
                 _log.info(
-                    "Authentication complete for '%s': tier=OAUTH scopes=%s", alias, scopes
+                    "Authentication complete for '%s': tier=OAUTH method=%s scopes=%s session_err=%s",
+                    alias, result.method, scopes, reason,
                 )
 
             return (
@@ -567,9 +598,13 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
             active = _active_alias()
             bdir = _browser_dir(active)
             udd = bdir if has_browser_profile(bdir) else None
+            _invalidate_voyager(active)  # the validation client opens the same profile
             _log.debug("set_web_session: validating session for '%s' (browser_dir=%s)", active, udd)
             vc = VoyagerClient(li_at, jsessionid, user_data_dir=udd)
-            me = vc.get_me()
+            try:
+                me = vc.get_me()
+            finally:
+                vc.close()
             name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
             headline = me.get("headline", "")
             save_web_session(li_at, jsessionid, active)
@@ -588,6 +623,45 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
                 f"   {_format_error(exc)}\n\n"
                 "Run `authenticate` first to set up the browser profile, then try again."
             )
+
+
+@mcp.tool()
+def refresh_web_session() -> str:
+    """
+    Re-read the LinkedIn session cookies from the persistent browser profile.
+
+    Use this when `check_auth` shows tier OAUTH even though you logged in
+    inside the Playwright login window, or after LinkedIn rotated JSESSIONID.
+    No browser interaction is needed: the profile at
+    ~/.linkedin_mcp_browser_<alias>/ is opened headlessly and its cookies are
+    stored as the active account's web session.
+    """
+    with _tool_log("refresh_web_session"):
+        try:
+            active = _active_alias()
+            bdir = _browser_dir(active)
+            if not has_browser_profile(bdir):
+                return (
+                    f"❌ No browser profile for '{active}'. Run `authenticate` first "
+                    "(the Playwright login window creates it)."
+                )
+            _invalidate_voyager(active)  # Chromium locks the profile; free it first
+            li_at, jsessionid, err = _run_in_thread(harvest_session_from_profile, bdir)
+            if not li_at:
+                return (
+                    f"❌ Could not recover a session from the browser profile ({err}).\n"
+                    "   Run `authenticate` again and log in inside the window that opens, "
+                    "or use `set_web_session`."
+                )
+            save_web_session(li_at, jsessionid or "", active)
+            _log.info("Web session refreshed for '%s' from browser profile", active)
+            return (
+                f"✅ Web session refreshed for '{active}' from the browser profile.\n"
+                f"   JSESSIONID   : {'present' if jsessionid else 'will be refreshed on first use'}\n\n"
+                "Voyager tools (get_recent_activity, get_full_profile, ...) are enabled."
+            )
+        except Exception as exc:
+            return _format_error(exc)
 
 
 @mcp.tool()

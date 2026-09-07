@@ -23,20 +23,24 @@ Ask the user for a short alias for the account being authenticated:
 Call `authenticate(alias)`.
 
 What happens behind the scenes:
-1. The tool opens the user's default browser to LinkedIn's authorization page
-2. A Playwright-managed Chromium window handles the flow; a per-alias browser
-   profile is stored at `~/.linkedin_mcp_browser_<alias>/` for consistent identity
-3. The OAuth callback is intercepted inside Playwright — no separate local server
-4. The user approves → LinkedIn redirects with an auth code
+1. A short headless probe checks that Playwright's Chromium can reach linkedin.com
+2. A headed Playwright Chromium window opens on LinkedIn's authorization page,
+   using the per-alias profile at `~/.linkedin_mcp_browser_<alias>/` — the same
+   profile the Voyager client reuses headlessly, so cookies and fingerprint match
+3. A local HTTP callback server on port 8919 receives the OAuth redirect
+4. The user logs in and approves → LinkedIn redirects with an auth code
 5. The code is exchanged for an access token (valid ~60 days), saved to the OS
    keychain as `oauth_token:<alias>` (fallback: `~/.linkedin_mcp_token_<alias>.json`)
-6. Browser session cookies (`li_at`, `JSESSIONID`) are harvested from the Playwright
-   context and saved as `session:<alias>` in the keychain → Voyager tier unlocked
+6. Browser session cookies (`li_at`, `JSESSIONID`) are read from the Playwright
+   profile and saved as `session:<alias>` in the keychain → Voyager tier unlocked
 7. The alias is registered in `~/.linkedin_mcp_users.json` and set as active
 
-If Playwright is unavailable, the flow falls back to `webbrowser.open()` + a
-local HTTP server on port 8919; Voyager cookies are not captured in this path
-and must be set manually with `set_web_session`.
+If Playwright is not installed or the probe fails (firewall), the flow falls
+back to the system browser (Chrome preferred) + the same callback server, then
+tries to read the cookies from Chrome's cookie store; that needs macOS Keychain
+access to Chrome Safe Storage and may fail. `LINKEDIN_AUTH_MODE` forces a path.
+A session that exists in the profile but not in the keychain can always be
+recovered with `refresh_web_session`.
 
 ## Confirm success
 
@@ -46,7 +50,8 @@ After `authenticate` returns:
 3. Present the user's name and headline in a friendly confirmation message
 4. If `tier` is `VOYAGER`: mention full profile sections, notifications, and
    messaging are now accessible
-5. If `tier` is `OAUTH`: mention Voyager was not captured and offer `set_web_session`
+5. If `tier` is `OAUTH`: call `refresh_web_session`; if it still fails, mention
+   Voyager was not captured and offer `set_web_session`
 
 ## Multi-account management
 

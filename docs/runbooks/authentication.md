@@ -18,7 +18,7 @@ The token is sent as `Authorization: Bearer <token>` on every LinkedIn REST API 
 
 ### Layer 2 — Browser session cookies (VOYAGER tier)
 
-Captured automatically from Chrome's cookie store after OAuth. Stored under `session:<alias>`. Consists of two cookies:
+Captured automatically during `authenticate`: the login happens in a Playwright browser window on the per-alias profile (`~/.linkedin_mcp_browser_<alias>/`) and the cookies are read from that profile once you approve the app. If Playwright's Chromium cannot reach the network, the flow falls back to your system browser and Chrome's cookie store. Stored under `session:<alias>`. Consists of two cookies:
 - `li_at` — LinkedIn session token (primary auth for Voyager API)
 - `JSESSIONID` — CSRF protection token (required alongside `li_at`)
 
@@ -35,6 +35,20 @@ Call `check_auth` at any time to see the active account's current state:
   scopes: email, openid, profile, w_member_social
   keychain: credentials ✓  session ✓
 ```
+
+---
+
+## Refreshing the web session
+
+The browser profile keeps the LinkedIn login. If `check_auth` shows `tier: OAUTH` although you logged in inside the window, or a Voyager tool starts failing after LinkedIn rotated `JSESSIONID`:
+
+```
+"Refresh my LinkedIn web session"
+```
+
+This runs `refresh_web_session`, which re-reads the cookies from the profile headlessly — no browser interaction. The server also does this on its own the first time a Voyager tool is used with a profile but no stored session. Without the server running, `python scripts/recover_voyager_session.py <alias>` does the same.
+
+Force a specific login path with `LINKEDIN_AUTH_MODE=playwright` (always the window) or `LINKEDIN_AUTH_MODE=browser` (always the system browser) in the server's environment.
 
 ---
 

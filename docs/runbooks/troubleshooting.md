@@ -97,19 +97,21 @@ lsof -i :8919
 
 ---
 
-### Chrome not found / cookies not captured
+### Web session not captured after `authenticate`
 
-**Cause:** Google Chrome is not installed, or the system default browser is not Chrome, so `browser_cookie3` cannot find the LinkedIn cookies.
+`authenticate` reports which path it used. Match the message:
 
-**Diagnose:**
-```bash
-ls "/Applications/Google Chrome.app"   # macOS
-which google-chrome                     # Linux
-```
+**"not captured via Playwright login window"** — you approved the app but no `li_at` was found in the profile (usually the window was closed before LinkedIn finished setting cookies).
+- Run `refresh_web_session`. If you are still logged in inside that profile it recovers the session without a browser.
+- Otherwise re-run `authenticate` and wait for the "LinkedIn connected" page before closing anything.
 
-**Fix option 1 — Install Chrome** and re-run `authenticate`.
+**"not captured via system browser + Chrome cookie store"** — the Playwright window was skipped. `authenticate` only does that when Playwright is missing or its Chromium could not reach linkedin.com.
+- Diagnose: `python scripts/diagnose.py` (checks the Chromium launch *and* network reach, and prints which path `authenticate` will take).
+- No Chromium: `cd mcp && .venv/bin/playwright install chromium`.
+- Firewall: allow "Google Chrome for Testing" (Playwright's Chromium) outbound in macOS Application Firewall / Little Snitch, or set `LINKEDIN_AUTH_MODE=playwright` to surface the exact launch error.
+- "Unable to get key for cookie decryption" on this path means macOS refused Keychain access to *Chrome Safe Storage* for the server process. Fixing the Playwright path above avoids the Keychain entirely.
 
-**Fix option 2 — Set session manually:**
+**Fix of last resort — set the session manually:**
 1. Open https://www.linkedin.com in Chrome, log in.
 2. DevTools → Application → Cookies → `https://www.linkedin.com`
 3. Copy `li_at` and `JSESSIONID`.

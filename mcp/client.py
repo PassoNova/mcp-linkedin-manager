@@ -408,8 +408,17 @@ class VoyagerClient:
                 if route.request.resource_type in VoyagerClient._BLOCKED
                 else route.continue_(),
             )
-            # Always re-inject credentials so the profile has fresh cookies on every open.
-            self._inject_cookies()
+            # Inject the stored credentials only when the profile has no session of
+            # its own. A login performed inside the Playwright window leaves fresher
+            # cookies in the profile than the copy in the keychain; overwriting them
+            # would break the fingerprint/cookie pairing LinkedIn checks. If the
+            # profile's session turns out to be stale, _browser_request() re-injects
+            # on the login redirect and retries.
+            live = self._context.cookies("https://www.linkedin.com")
+            if any(c.get("name") == "li_at" for c in live):
+                _log.debug("VoyagerClient: profile already holds a LinkedIn session; keeping it")
+            else:
+                self._inject_cookies()
             atexit.register(self.close)
             _log.info("VoyagerClient: Playwright context ready at %s", self._user_data_dir)
 
