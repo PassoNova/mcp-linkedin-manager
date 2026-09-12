@@ -80,7 +80,9 @@ from client import LinkedInClient, VoyagerClient
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────
 
-load_dotenv()
+# Explicit path: python-dotenv would otherwise search upward and could still pick
+# up a legacy repository-root .env that the docs say is no longer read.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 _log = logging.getLogger("linkedin_mcp.server")
 
@@ -244,8 +246,12 @@ def _remove_browser_profile(alias: str) -> bool:
     bdir = _browser_dir(alias)
     if os.path.islink(bdir):
         raise ValueError(f"refusing to remove {bdir}: it is a symlink")
-    if not os.path.isdir(bdir):
+    if not os.path.lexists(bdir):
         return False
+    if not os.path.isdir(bdir):
+        # Fail closed: something is at the profile path but it is not a directory,
+        # so "removed" cannot honestly be reported. Leave it for the operator.
+        raise ValueError(f"refusing to remove {bdir}: it exists but is not a directory")
     shutil.rmtree(bdir)
     _log.info("Browser profile removed for '%s' (%s)", alias, bdir)
     return True

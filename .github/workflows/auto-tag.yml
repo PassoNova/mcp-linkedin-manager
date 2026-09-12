@@ -60,7 +60,7 @@ jobs:
 
       - name: Run tests
         working-directory: mcp
-        run: uv run pytest tests/ --ignore=tests/test_playwright_pool.py -v
+        run: uv run pytest tests/ -v
 
   build-and-release:
     needs: [tag, test]

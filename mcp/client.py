@@ -447,24 +447,27 @@ class VoyagerClient:
         """
         errors: list[str] = []
         with self._lock:
+            # Each handle is dropped only once its close succeeded; a failed close
+            # keeps its handle so a later close() can retry instead of leaking a
+            # live Chromium behind a client that already forgot about it.
             try:
                 if self._page is not None:
                     self._page.close()
+                self._page = None
             except Exception as exc:
                 errors.append(f"page.close: {exc}")
             try:
                 if self._context is not None:
                     self._context.close()
+                self._context = None
             except Exception as exc:
                 errors.append(f"context.close: {exc}")
             try:
                 if self._playwright is not None:
                     self._playwright.__exit__(None, None, None)
+                self._playwright = None
             except Exception as exc:
                 errors.append(f"playwright.stop: {exc}")
-            self._page = None
-            self._context = None
-            self._playwright = None
         if errors:
             raise RuntimeError("VoyagerClient teardown incomplete: " + "; ".join(errors))
 
