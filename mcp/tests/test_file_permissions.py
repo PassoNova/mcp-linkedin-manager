@@ -178,3 +178,35 @@ class TestLogFile:
             assert _mode(log_file) == 0o600
         finally:
             h.close()
+
+    def test_existing_loose_backups_are_tightened_at_setup_and_rollover(self, tmp_path):
+        import log_config
+        log_file = tmp_path / "up.log"
+        for i in (1, 2):
+            b = tmp_path / f"up.log.{i}"
+            b.write_text("old\n")
+            os.chmod(b, 0o644)
+        h = log_config._PrivateRotatingFileHandler(str(log_file), maxBytes=16, backupCount=3, encoding="utf-8")
+        try:
+            assert _mode(tmp_path / "up.log.1") == 0o600 and _mode(tmp_path / "up.log.2") == 0o600
+            h.emit(logging.LogRecord("t", logging.INFO, __file__, 1, "x" * 40, None, None))
+            h.doRollover()
+            for name in ("up.log", "up.log.1", "up.log.2", "up.log.3"):
+                assert _mode(tmp_path / name) == 0o600, name
+        finally:
+            h.close()
+
+    def test_setup_fails_closed_when_log_cannot_be_tightened(self, tmp_path, monkeypatch):
+        import log_config
+        log_file = tmp_path / "ro.log"
+        monkeypatch.setattr(log_config, "LOG_FILE", str(log_file))
+        monkeypatch.setattr(os, "fchmod", MagicMock(side_effect=PermissionError("nope")))
+        root = logging.getLogger("linkedin_mcp")
+        saved = list(root.handlers)
+        root.handlers.clear()
+        try:
+            with pytest.raises(OSError, match="owner-only"):
+                log_config.setup()
+            assert root.handlers == []
+        finally:
+            root.handlers[:] = saved

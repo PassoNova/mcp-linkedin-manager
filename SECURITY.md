@@ -23,7 +23,11 @@ The server runs locally, as a child process of Claude, and talks only to
 In addition, the Playwright profile `~/.linkedin_mcp_browser_<alias>/` contains
 the live browser session (equivalent to being logged in to LinkedIn). It is
 created `0700` and re-tightened every time it is opened. The log file
-`~/.linkedin_mcp.log` is `0600`.
+`~/.linkedin_mcp.log` and its rotated backups are `0600`.
+
+The `0600` / `0700` guarantees are POSIX (macOS, Linux). On Windows, Python's
+`os.chmod` cannot set an owner-only ACL; there the protection is whatever the
+per-user location under your profile directory gives you.
 
 Things the project deliberately does **not** do:
 
@@ -52,9 +56,10 @@ conversations, none of which the official Consumer API exposes.
 - Consequences can include warnings, temporary restrictions (e.g. forced
   re-verification, rate limits) or **suspension of your LinkedIn account**.
 - Voyager is **off unless a web session exists** for the active alias. If no
-  `li_at` cookie has been captured (or it has expired), no request touches
-  Voyager and the tools that need it fall back to the official API or report
-  the missing session. `clear_web_session` switches it off: it deletes the
+  `li_at` cookie has been captured, no request touches Voyager and the tools
+  that need it fall back to the official API or report the missing session.
+  (A captured cookie that LinkedIn has since expired is still sent once and
+  rejected; the server does not pre-validate cookies.) `clear_web_session` switches it off: it deletes the
   stored cookies **and** the per-alias browser profile (the server would
   otherwise re-harvest the session from the still-logged-in profile on the
   next call). Voyager stays off until you run `authenticate` again.

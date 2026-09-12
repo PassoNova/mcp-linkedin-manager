@@ -680,12 +680,21 @@ def clear_web_session() -> str:
         try:
             active = _active_alias()
             _invalidate_voyager(active)  # release Chromium's lock on the profile first
-            existed = delete_web_session(active)
+            # Profile first: if its removal fails, the stored session is left in
+            # place so a logged-in profile is never left behind for recovery.
             bdir = _browser_dir(active)
             profile_removed = os.path.isdir(bdir)
             if profile_removed:
                 shutil.rmtree(bdir)
                 _log.info("Browser profile removed for '%s' (%s)", active, bdir)
+            existed = delete_web_session(active)
+            if load_web_session(active) is not None:
+                # delete_web_session swallows keychain errors; verify, don't trust.
+                return (
+                    f"❌ Could not remove the stored web session for '{active}' from the "
+                    f"OS keychain — check the log, or delete the `linkedin-mcp / session:{active}` "
+                    f"entry manually."
+                )
             if existed or profile_removed:
                 _log.info("Web session cleared for '%s'", active)
                 return (

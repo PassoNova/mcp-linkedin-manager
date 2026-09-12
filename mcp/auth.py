@@ -119,6 +119,9 @@ def ensure_private_dir(path: str) -> None:
     never be group- or world-readable. ``os.makedirs(mode=...)`` is masked by
     the umask, and pre-existing directories are left untouched by it, so an
     explicit ``chmod`` follows in both cases.
+
+    POSIX only: on Windows ``os.chmod`` cannot express an owner-only ACL, so
+    there the guarantee is only what the per-user profile location provides.
     """
     os.makedirs(path, mode=0o700, exist_ok=True)
     os.chmod(path, 0o700)

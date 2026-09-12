@@ -38,6 +38,10 @@ class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
     existed with looser permissions.
     """
 
+    def __init__(self, filename: str, **kwargs) -> None:
+        super().__init__(filename, **kwargs)
+        self._tighten_backups()
+
     def _open(self):  # type: ignore[override]
         flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
         if self.mode.startswith("w"):
@@ -46,9 +50,31 @@ class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
         try:
             if hasattr(os, "fchmod"):
                 os.fchmod(fd, 0o600)
-        except OSError:
-            pass  # e.g. a log file owned by another user; logging still works
+        except OSError as exc:
+            # Fail closed: never keep writing to a log we could not make owner-only
+            # (e.g. a file owned by another user). Point LINKEDIN_MCP_LOG elsewhere.
+            os.close(fd)
+            raise OSError(
+                f"refusing to log to {self.baseFilename}: cannot make it owner-only ({exc}); "
+                "fix its ownership/permissions or set LINKEDIN_MCP_LOG to another path"
+            ) from exc
         return open(fd, self.mode, encoding=self.encoding, errors=self.errors)
+
+    def _tighten_backups(self) -> None:
+        """Re-apply 0600 to rotated backups (``<log>.1`` … ``<log>.N``).
+
+        Backups written by an older version, or by a stock handler, keep the
+        mode they were created with; rollover only renames them. Run at
+        setup and after every rollover.
+        """
+        for i in range(1, self.backupCount + 1):
+            backup = self.rotation_filename(f"{self.baseFilename}.{i}")
+            if os.path.exists(backup):
+                os.chmod(backup, 0o600)
+
+    def doRollover(self) -> None:  # noqa: N802 - logging API
+        super().doRollover()
+        self._tighten_backups()
 
 
 def setup() -> None:

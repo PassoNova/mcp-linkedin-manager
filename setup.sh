@@ -27,18 +27,16 @@ else
     echo "✅ uv already installed: $(uv --version)"
 fi
 
-# ── 2. Create virtual environment in mcp/ ─────────────────────────────────────
+# ── 2. Create the virtual environment and install locked dependencies ────────
+# `uv sync` (not `uv pip install`) so mcp/uv.lock and the
+# [tool.uv] constraint-dependencies floors in pyproject.toml are honoured.
 echo ""
-echo "▶ Creating virtual environment in mcp/..."
+echo "▶ Installing dependencies from uv.lock into mcp/.venv..."
 cd "$MCP_DIR"
-uv venv --python 3.11 2>/dev/null || uv venv
-echo "✅ Virtual environment ready at $MCP_DIR/.venv"
+uv sync
+echo "✅ Dependencies installed at $MCP_DIR/.venv"
 
-# ── 3. Install dependencies ───────────────────────────────────────────────────
-echo ""
-echo "▶ Installing dependencies..."
-uv pip install -e .
-echo "✅ Dependencies installed"
+# ── 3. (merged into step 2) ───────────────────────────────────────────────────
 
 # ── 4. Verify server syntax ───────────────────────────────────────────────────
 echo ""

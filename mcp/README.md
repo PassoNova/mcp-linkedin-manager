@@ -151,7 +151,7 @@ mcp/
 
 | Symptom | Fix |
 |---|---|
-| `credentials are not configured` | Check `~/.linkedin_mcp.env` and restart Claude |
+| `credentials are not configured` | Run `uv run python -m linkedin_mcp setup` (keychain), or set `LINKEDIN_CLIENT_ID` / `LINKEDIN_CLIENT_SECRET` in the server's environment, then restart Claude |
 | `401 Unauthorized` | Token expired — run `authenticate` again |
 | `403 Forbidden` on `update_headline` | Voyager session needed — run `authenticate` |
 | `403 Forbidden` on profile sections | Use `get_full_profile` (Voyager) instead |

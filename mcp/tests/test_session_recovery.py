@@ -165,3 +165,21 @@ class TestClearWebSessionRemovesProfile:
         server, _, _ = srv
         monkeypatch.setattr(server, "delete_web_session", lambda alias: False)
         assert server.clear_web_session().startswith("ℹ️")
+
+    def test_profile_removal_failure_keeps_stored_session(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        _make_profile(tmp_path)
+        store["work"] = {"li_at": "L", "jsessionid": "J"}
+        deleted = []
+        monkeypatch.setattr(server, "delete_web_session", lambda alias: deleted.append(alias) or True)
+        monkeypatch.setattr(server.shutil, "rmtree", MagicMock(side_effect=OSError("busy")))
+        out = server.clear_web_session()
+        assert "busy" in out
+        assert deleted == [] and store["work"]["li_at"] == "L"
+
+    def test_reports_failure_when_keychain_entry_survives(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        store["work"] = {"li_at": "L", "jsessionid": "J"}
+        monkeypatch.setattr(server, "delete_web_session", lambda alias: True)  # lies: file gone, keychain not
+        out = server.clear_web_session()
+        assert out.startswith("❌") and "keychain" in out

@@ -24,9 +24,12 @@ INSTALL_DIR="${1:-$HOME/linkedin-mcp}"
 VERSION="${LINKEDIN_MCP_VERSION:-}"
 MCP_NAME="linkedin-manager"
 ASSET="linkedin-mcp.plugin"
-TMP_PLUGIN="$(mktemp /tmp/linkedin-mcp-XXXXXX.plugin)"
-TMP_SUM="${TMP_PLUGIN}.sha256"
-trap 'rm -f "$TMP_PLUGIN" "$TMP_SUM"' EXIT
+# Private (0700) scratch directory so no other local user can pre-create or
+# symlink the paths curl writes to.
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/linkedin-mcp-XXXXXX")"
+TMP_PLUGIN="$TMP_DIR/$ASSET"
+TMP_SUM="$TMP_DIR/$ASSET.sha256"
+trap 'rm -rf "$TMP_DIR"' EXIT
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -64,10 +67,9 @@ fi
 
 # ── Validate install directory ─────────────────────────────────────────────────
 # `rm -rf "$INSTALL_DIR"` below is only ever run against a directory that is
-# new, empty, or a previous install made by this script. Installs are marked
-# with $MARKER (written after extraction); installs that predate the marker
-# are recognised by mcp/server.py *without* a .git entry, so a source checkout
-# (this repository, or any other) is never deleted.
+# new, empty, or carries the $MARKER file this script writes after extraction.
+# Nothing else is accepted as evidence of a previous install: installs that
+# predate the marker must be removed by hand once (the error says how).
 
 MARKER=".linkedin-mcp-install"
 INSTALL_DIR="${INSTALL_DIR%/}"
@@ -87,12 +89,21 @@ fi
 if [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR" ]; then
     err "'$INSTALL_DIR' exists and is not a directory."
 fi
-if [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
-    if [ -e "$INSTALL_DIR/.git" ]; then
-        err "'$INSTALL_DIR' is a git checkout. Refusing to delete it — install into a dedicated directory instead."
+if [ -d "$INSTALL_DIR" ]; then
+    # Fail closed: an unreadable directory is not an empty one.
+    if ! LISTING="$(ls -A "$INSTALL_DIR" 2>/dev/null)"; then
+        err "Cannot read '$INSTALL_DIR'. Refusing to touch it."
     fi
-    if [ ! -f "$INSTALL_DIR/$MARKER" ] && [ ! -f "$INSTALL_DIR/mcp/server.py" ]; then
-        err "'$INSTALL_DIR' is not empty and is not a previous linkedin-mcp install (no $MARKER). Refusing to delete it — choose another directory or clear it yourself."
+    if [ -n "$LISTING" ]; then
+        if [ -e "$INSTALL_DIR/.git" ]; then
+            err "'$INSTALL_DIR' is a git checkout. Refusing to delete it — install into a dedicated directory instead."
+        fi
+        if [ ! -f "$INSTALL_DIR/$MARKER" ]; then
+            if [ -f "$INSTALL_DIR/mcp/server.py" ]; then
+                err "'$INSTALL_DIR' looks like a linkedin-mcp install made before installs were marked. Refusing to delete it automatically — check its contents, then remove it yourself (rm -rf '$INSTALL_DIR') and re-run."
+            fi
+            err "'$INSTALL_DIR' is not empty and is not a previous linkedin-mcp install (no $MARKER). Refusing to delete it — choose another directory or clear it yourself."
+        fi
     fi
 fi
 

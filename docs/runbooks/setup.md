@@ -72,7 +72,7 @@ When prompted:
 The credentials are written directly to:
 - **macOS**: Keychain Access (`linkedin-mcp / credentials`)
 - **Windows**: Windows Credential Manager
-- **Linux**: Secret Service (libsecret) or `~/.linkedin_mcp_credentials.json` as fallback
+- **Linux**: Secret Service (libsecret). There is **no file fallback** for app credentials — without a keychain backend the wizard exits and you must use environment variables or the `.env` file below.
 
 No `.env` file is created. You do not need to set any environment variables.
 
