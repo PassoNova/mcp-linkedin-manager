@@ -58,7 +58,7 @@ After `authenticate` returns:
 After authentication, the user can:
 - `list_users` — see all registered aliases with tier and auth status
 - `switch_user(alias)` — change the active account; all tools switch immediately
-- `logout(alias)` — remove one account's credentials (defaults to active)
+- `logout(alias)` — remove one account's OAuth token, web session and logged-in browser profile, and unregister the alias (defaults to active)
 - `authenticate(alias)` again — re-authenticates and replaces tokens for that alias
 
 ## Handle errors

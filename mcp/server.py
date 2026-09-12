@@ -449,7 +449,12 @@ async def authenticate(alias: str) -> str:
                 # the alias, so nothing persisted and reporting success would be a lie;
                 # a plain clear keeps the OAuth token and only loses the web session.
                 if _session_generation.get(alias, 0) != generation:
-                    if alias not in load_user_registry().get("aliases", []):
+                    # A logout that failed halfway can leave the alias registered with
+                    # the token already gone; treat a missing token like a logout too.
+                    if (
+                        alias not in load_user_registry().get("aliases", [])
+                        or load_token(alias) is None
+                    ):
                         _remove_browser_profile(alias)
                         delete_token(alias)
                         _log.warning("authenticate('%s') discarded: logged out mid-flight", alias)
@@ -528,6 +533,11 @@ def logout(alias: str = "") -> str:
                         f"'{target}' manually) and run `logout` again."
                     )
                 deregister_alias(target)  # inside the lock: no authenticate can cross this boundary
+                # Retire the clear tombstone: the profile and session are gone, so there
+                # is nothing left to block recovery of. The generation counter and the
+                # alias lock are kept on purpose: an in-flight authenticate compares
+                # against the counter, and dropping it back to 0 could hide this logout.
+                _cleared_pending.discard(target)
             _log.info("Logged out '%s'", target)
             return f"✅ '{target}' logged out and removed."
         except Exception as exc:

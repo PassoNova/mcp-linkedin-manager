@@ -478,10 +478,17 @@ class VoyagerClient:
             self._teardown()
             return
         try:
-            self._executor.submit(self._teardown).result(timeout=60)
-        except Exception as exc:  # executor already shut down, or teardown timed out
-            _log.warning("VoyagerClient: executor teardown unavailable (%s); closing inline", exc)
+            future = self._executor.submit(self._teardown)
+        except RuntimeError:
+            # The executor is shut down, so no Playwright work can be running on it;
+            # tearing down inline cannot race with anything.
             self._teardown()
+            return
+        # Never tear down from this thread while the executor may still be using the
+        # page: wait for the executor to do it. A timeout means a Voyager request is
+        # still running; surface that instead of racing it, so callers do not go on
+        # to delete a profile Chromium is still using.
+        future.result(timeout=120)
 
     def __del__(self) -> None:
         try:

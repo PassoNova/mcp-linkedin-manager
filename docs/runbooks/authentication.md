@@ -101,7 +101,7 @@ personal  OAUTH     2026-07-01
 logout("personal")
 ```
 
-Removes the OAuth token and browser session for that alias from the keychain. The alias is de-registered. App credentials are not affected.
+Removes the OAuth token and web session for that alias from the keychain **and deletes the alias's persistent browser profile** (`~/.linkedin_mcp_browser_<alias>/`, which held the logged-in LinkedIn session). The alias is de-registered. App credentials are not affected.
 
 ---
 
