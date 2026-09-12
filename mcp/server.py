@@ -396,9 +396,21 @@ async def authenticate(alias: str) -> str:
                 _invalidate_voyager_unlocked(alias)
                 generation = _session_generation.get(alias, 0)
 
-            result = await run_oauth_flow(
-                client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
-            )
+            try:
+                result = await run_oauth_flow(
+                    client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
+                )
+            except Exception:
+                # The flow failed (timeout, closed window, denied consent) but may still
+                # have written cookies into the profile. If a clear/logout happened while
+                # the window was open, that profile must not survive the clear.
+                with _alias_lock(alias):
+                    if _session_generation.get(alias, 0) != generation:
+                        _remove_browser_profile(alias)
+                        _log.warning(
+                            "authenticate('%s') failed after a mid-flight clear; profile removed", alias
+                        )
+                raise
             with _alias_lock(alias):
                 if _lifecycle_generation(alias) != generation:
                     # clear_web_session / logout ran while the window was open: persist
@@ -430,6 +442,21 @@ async def authenticate(alias: str) -> str:
                     jsessionid=None,
                     session_error="the web session was cleared while the login was in progress",
                 )
+            with _alias_lock(alias):
+                # Final check after every write: if `logout` won the race, it has already
+                # deleted the token and deregistered the alias, so nothing persisted and
+                # reporting success would be a lie. A plain clear keeps the token.
+                if (
+                    _session_generation.get(alias, 0) != generation
+                    and alias not in load_user_registry().get("aliases", [])
+                ):
+                    _remove_browser_profile(alias)
+                    delete_token(alias)
+                    _log.warning("authenticate('%s') discarded: logged out mid-flight", alias)
+                    return (
+                        f"❌ Login discarded: '{alias}' was logged out while the login was in "
+                        "progress, so nothing was saved. Run `authenticate` again."
+                    )
             if result.li_at:
                 tier_note = (
                     "Voyager API enabled"
@@ -750,14 +777,17 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
                 vc.close()
             name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
             headline = me.get("headline", "")
-            if not _save_session_if_current(li_at, jsessionid, active, generation):
-                with _alias_lock(active):
+            with _alias_lock(active):
+                # Save, failure cleanup and singleton invalidation in one lock scope, so a
+                # concurrent Voyager request cannot create a client that is then closed
+                # underneath it between the save and the invalidation.
+                if not _save_session_if_current(li_at, jsessionid, active, generation):
                     _remove_browser_profile(active)  # validation may have re-created it
-                return (
-                    f"❌ Not saved: the web session for '{active}' was cleared while it was "
-                    "being validated. Run `set_web_session` again if you still want it."
-                )
-            _invalidate_voyager(active)
+                    return (
+                        f"❌ Not saved: the web session for '{active}' was cleared while it was "
+                        "being validated. Run `set_web_session` again if you still want it."
+                    )
+                _invalidate_voyager_unlocked(active)
             _log.info("Web session saved for '%s' (verified as %s)", active, name)
             return (
                 f"✅ Web session saved for '{active}'\n"
@@ -843,10 +873,10 @@ def clear_web_session() -> str:
                 except RuntimeError as exc:
                     _log.warning("clear_web_session: %s", exc)
                     return (
-                        f"❌ Browser profile and session file removed, but the stored web "
-                        f"session for '{active}' could not be removed from the OS keychain "
-                        f"({exc}). Delete the `linkedin-mcp / session:{active}` entry manually "
-                        f"and re-run."
+                        f"❌ Browser profile {'removed' if profile_removed else 'was not present'}, "
+                        f"but the stored web session for '{active}' could not be removed from "
+                        f"the OS keychain ({exc}). Delete the `linkedin-mcp / session:{active}` "
+                        f"entry manually and re-run."
                     )
             if existed or profile_removed:
                 _log.info("Web session cleared for '%s'", active)

@@ -28,7 +28,7 @@ grep "ERROR\|FAIL\|Exception" ~/.linkedin_mcp.log
 cd mcp
 uv run python -m linkedin_mcp setup
 ```
-Enter Client ID and Client Secret when prompted. If the keychain backend is unavailable, copy `.env.example` to `.env` and fill in values — they are migrated to the keychain on the next `authenticate` only when a keychain backend is available; without one, the `.env` stays the source of the credentials, so keep it.
+Enter Client ID and Client Secret when prompted. If the keychain backend is unavailable, copy `../.env.example` (it lives at the repository root, you are in `mcp/`) to `.env`, run `chmod 600 .env`, and fill in values — they are migrated to the keychain on the next `authenticate` only when a keychain backend is available; without one, the `.env` stays the source of the credentials, so keep it.
 
 ---
 

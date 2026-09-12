@@ -38,7 +38,7 @@ This stores credentials in macOS Keychain, Windows Credential Manager, or Linux
 Secret Service. No `.env` file is created.
 
 **Alternative (bootstrap via .env):** If the OS keychain is unavailable, the
-user can copy `.env.example` to `.env` (`chmod 600 .env`) and fill in the
+user can copy `../.env.example` (repository root) to `.env` (`chmod 600 .env`) and fill in the
 credentials. With a keychain backend they are migrated on the first
 `authenticate` call; without one the `.env` file must be kept.
 
