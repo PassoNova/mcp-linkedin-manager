@@ -443,19 +443,24 @@ async def authenticate(alias: str) -> str:
                     session_error="the web session was cleared while the login was in progress",
                 )
             with _alias_lock(alias):
-                # Final check after every write: if `logout` won the race, it has already
-                # deleted the token and deregistered the alias, so nothing persisted and
-                # reporting success would be a lie. A plain clear keeps the token.
-                if (
-                    _session_generation.get(alias, 0) != generation
-                    and alias not in load_user_registry().get("aliases", [])
-                ):
-                    _remove_browser_profile(alias)
-                    delete_token(alias)
-                    _log.warning("authenticate('%s') discarded: logged out mid-flight", alias)
-                    return (
-                        f"❌ Login discarded: '{alias}' was logged out while the login was in "
-                        "progress, so nothing was saved. Run `authenticate` again."
+                # Final check after every write. Any generation change means a clear or a
+                # logout completed while the login was in progress: the web session it
+                # captured is gone. A logout has also deleted the token and deregistered
+                # the alias, so nothing persisted and reporting success would be a lie;
+                # a plain clear keeps the OAuth token and only loses the web session.
+                if _session_generation.get(alias, 0) != generation:
+                    if alias not in load_user_registry().get("aliases", []):
+                        _remove_browser_profile(alias)
+                        delete_token(alias)
+                        _log.warning("authenticate('%s') discarded: logged out mid-flight", alias)
+                        return (
+                            f"❌ Login discarded: '{alias}' was logged out while the login was in "
+                            "progress, so nothing was saved. Run `authenticate` again."
+                        )
+                    result = result._replace(
+                        li_at=None,
+                        jsessionid=None,
+                        session_error="the web session was cleared while the login was in progress",
                     )
             if result.li_at:
                 tier_note = (
@@ -880,9 +885,13 @@ def clear_web_session() -> str:
                     )
             if existed or profile_removed:
                 _log.info("Web session cleared for '%s'", active)
+                removed = " and ".join(
+                    part for part, done in (("stored cookies removed", existed),
+                                            ("browser profile removed", profile_removed)) if done
+                )
                 return (
-                    f"✅ Web session cleared for '{active}' (stored cookies and browser "
-                    f"profile removed). Voyager stays off until you run `authenticate` again."
+                    f"✅ Web session cleared for '{active}' ({removed}). "
+                    "Voyager stays off until you run `authenticate` again."
                 )
             return f"ℹ️ No web session found for '{active}' — nothing to clear."
         except Exception as exc:

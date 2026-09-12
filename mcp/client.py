@@ -368,6 +368,7 @@ class VoyagerClient:
         self._page: Any = None
         self._lock = threading.Lock()
         self._closed = False  # set by close(); a closed client never reopens the profile
+        self._executor_thread: Optional[threading.Thread] = None  # where Playwright objects live
         # Single dedicated thread so Playwright sync API never runs inside asyncio.
         self._executor = ThreadPoolExecutor(max_workers=1)
 
@@ -402,6 +403,7 @@ class VoyagerClient:
                     "needed for Voyager API access."
                 )
             _log.debug("VoyagerClient: launching Playwright context at %s", self._user_data_dir)
+            self._executor_thread = threading.current_thread()
             ensure_private_dir(self._user_data_dir)  # profile holds the live session cookie
             self._playwright = _sync_playwright().__enter__()
             self._context = self._playwright.chromium.launch_persistent_context(
@@ -430,14 +432,13 @@ class VoyagerClient:
             atexit.register(self.close)
             _log.info("VoyagerClient: Playwright context ready at %s", self._user_data_dir)
 
-    def close(self) -> None:
-        """Close the persistent browser context and release Playwright.
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("VoyagerClient is closed; the web session was cleared or replaced")
 
-        The client is permanently closed afterwards: a stale reference held
-        across clear_web_session / logout cannot recreate the deleted profile.
-        """
+    def _teardown(self) -> None:
+        """Release the Playwright objects. Must run on the thread that created them."""
         with self._lock:
-            self._closed = True
             try:
                 if self._page is not None:
                     self._page.close()
@@ -456,6 +457,31 @@ class VoyagerClient:
             self._page = None
             self._context = None
             self._playwright = None
+
+    def close(self) -> None:
+        """Close the persistent browser context and release Playwright.
+
+        The client is permanently closed afterwards: a stale reference held
+        across clear_web_session / logout cannot recreate the deleted profile,
+        and cached Voyager results are dropped so they cannot outlive the
+        session. Playwright's sync objects belong to the executor thread, so
+        the teardown is scheduled there (behind any in-flight request) and
+        awaited; callers can then remove the profile knowing Chromium is gone.
+        """
+        with self._lock:
+            self._closed = True
+            self._cache = SimpleCache()
+            nothing_open = self._playwright is None and self._context is None and self._page is None
+        if nothing_open:
+            return
+        if threading.current_thread() is self._executor_thread:
+            self._teardown()
+            return
+        try:
+            self._executor.submit(self._teardown).result(timeout=60)
+        except Exception as exc:  # executor already shut down, or teardown timed out
+            _log.warning("VoyagerClient: executor teardown unavailable (%s); closing inline", exc)
+            self._teardown()
 
     def __del__(self) -> None:
         try:
@@ -520,6 +546,7 @@ class VoyagerClient:
         Returns a normalized dict with keys: headline, first_name, last_name,
         public_id, entity_urn, picture_url.
         """
+        self._check_open()
         hit, cached = self._cache.get("get_me", _CACHE_TTL_ME)
         if hit:
             return cached
@@ -627,6 +654,7 @@ class VoyagerClient:
     def get_recent_posts(self, public_id: str, count: int = 10) -> list[dict]:
         """Scrape recent posts from the member's LinkedIn activity page."""
         cache_key = f"posts:{public_id}:{count}"
+        self._check_open()
         hit, cached = self._cache.get(cache_key, _CACHE_TTL_POSTS)
         if hit:
             return cached

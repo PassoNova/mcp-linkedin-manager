@@ -78,6 +78,10 @@ class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
                 os.chmod(backup, 0o600)
 
     def doRollover(self) -> None:  # noqa: N802 - logging API
+        # Tighten first: if an existing backup cannot be made owner-only, fail
+        # before any loose file is renamed into the rotation. Then again after,
+        # for the file the rollover just created.
+        self._tighten_backups()
         super().doRollover()
         self._tighten_backups()
 

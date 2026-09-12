@@ -34,13 +34,17 @@ For Claude Desktop / Claude Code, point `.mcp.json` at this path:
       "command": "uv",
       "args": ["run", "--directory", "/absolute/path/to/mcp", "python", "server.py"],
       "env": {
-        "LINKEDIN_CLIENT_ID": "<your-client-id>",
-        "LINKEDIN_CLIENT_SECRET": "<your-client-secret>"
+        "LINKEDIN_CLIENT_ID": "<your-client-id>"
       }
     }
   }
 }
 ```
+
+Do not put `LINKEDIN_CLIENT_SECRET` in that `env` block: `.mcp.json` and Claude's
+settings are plaintext files. Store the secret in the OS keychain with
+`python -m linkedin_mcp setup`, or, without a keychain backend, in a `chmod 600`
+`.env` next to `server.py` (see the README).
 
 ### Live log tail
 

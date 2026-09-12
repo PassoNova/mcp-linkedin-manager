@@ -118,6 +118,7 @@ Accepted for now; each is bounded and documented so nobody has to rediscover it.
   newline characters reads as empty and would be replaced. Such names do not
   occur in practice and the marker/git/`$HOME`/`/` guards still apply.
 
+- **`set_web_session` validates outside the lifecycle lock.** The standalone validation client opens the profile after the generation snapshot; a clear or logout during those seconds can remove the profile underneath it. The later generation check prevents the save; the validation itself may fail and is simply re-run. Accepted.
 - **Profile ownership across overlapping logins.** A stale `authenticate` that observes a
   lifecycle-generation bump removes the alias's profile; if a newer `authenticate` for the
   same alias started in between, that cleanup can remove the newer login's profile and the
