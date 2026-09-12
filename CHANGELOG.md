@@ -8,6 +8,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); version
 
 ## [Unreleased]
 
+### Security
+- **`.claude/settings.local.json` untracked.** The file had been committed since the first commit. It contained only local machine paths and pre-approved Claude Code command rules — never any credential values — but it is machine-specific and does not belong in a public repo. It is now ignored (`.claude/*.local.json`); history is unchanged.
+- **Playwright profile directory is owner-only.** `~/.linkedin_mcp_browser_<alias>/` holds the live LinkedIn session cookie and was created with default permissions. It is now created `0700` and re-`chmod`ed on every open (login, headless init, `harvest_session_from_profile`).
+- **Token / session fallback files are `0600` from creation.** They were opened with `open(path, "w")` and `chmod`ed afterwards, leaving a window at the default umask. They are now created via `os.open(..., 0o600)`.
+- **Log file is `0600`.** `~/.linkedin_mcp.log` can carry aliases, profile paths and API error bodies.
+- **OAuth CSRF check** compares the `state` parameter in constant time (`secrets.compare_digest`) and no longer echoes the expected value in the error message.
+- **Installers no longer persist the client secret.** `scripts/install.sh` and `setup.sh` passed `LINKEDIN_CLIENT_SECRET` to `claude mcp add --env`, which stores it in plaintext in Claude's config. They now register the server without credentials and direct users to `python -m linkedin_mcp setup` (OS keychain).
+- **`scripts/install.sh` hardening.** Verifies the downloaded archive against the release's `linkedin-mcp.plugin.sha256` (warns when an older release has none) and refuses to `rm -rf` `$HOME`, `/`, or a non-empty directory that is not a previous linkedin-mcp install. Releases now publish the `.sha256` file.
+- **Dependencies upgraded** past known advisories: `mcp>=1.28.1,<2` (2.x renames `FastMCP`; that migration is separate), `cryptography>=50`, `starlette>=1.3.1`, `pydantic-settings>=2.14.2`, `python-multipart>=0.0.31` (`pip-audit`: 13 findings → 0).
+- **Workflows:** `ci.yml` runs with `permissions: contents: read`; third-party actions are pinned to full commit SHAs.
+- **Voyager disclosure** added to `README.md` and the new `SECURITY.md`: Voyager is LinkedIn's unofficial internal API, using it may violate LinkedIn's terms and can lead to account restrictions, and it stays off unless a web session exists.
+
 ### Changed
 - **Login moves into a Playwright window on the per-alias profile.** `authenticate` now opens LinkedIn's authorization page in a headed Playwright Chromium using `~/.linkedin_mcp_browser_<alias>/` and reads `li_at` / `JSESSIONID` straight from that profile after approval. The Voyager client reuses the same profile, so cookies and fingerprint always match. The system-browser + `browser_cookie3` path is now the fallback, used only when a headless probe shows Playwright's Chromium cannot reach linkedin.com (`auth.probe_playwright_network`). `LINKEDIN_AUTH_MODE=auto|playwright|browser`, `LINKEDIN_AUTH_TIMEOUT`, and `LINKEDIN_PROBE_TIMEOUT_MS` control the behaviour.
 - `run_oauth_flow` returns an `OAuthResult` (`token_data`, `li_at`, `jsessionid`, `session_error`, `method`) instead of a 4-tuple, and runs all Playwright work on a worker thread (sync API).
