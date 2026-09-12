@@ -239,3 +239,35 @@ class TestLogoutRemovesProfile:
         out = server.logout("work")
         assert out.startswith("❌") and "locked" in out
         dereg.assert_not_called()
+
+
+class TestLifecycleGeneration:
+    def test_clear_bumps_generation_and_late_save_is_discarded(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        _make_profile(tmp_path)
+        monkeypatch.setattr(server, "delete_web_session", lambda alias, **kw: True)
+        gen = server._lifecycle_generation("work")
+        assert server.clear_web_session().startswith("✅")
+        assert server._lifecycle_generation("work") == gen + 1
+        assert server._save_session_if_current("L", "J", "work", gen) is False
+        assert "work" not in store
+        assert server._save_session_if_current("L", "J", "work", gen + 1) is True
+        assert store["work"]["li_at"] == "L"
+
+    def test_set_web_session_discards_when_cleared_during_validation(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+
+        def get_me_then_clear():
+            server._bump_generation("work")  # a concurrent clear_web_session lands here
+            return {"first_name": "A", "last_name": "B", "headline": "h"}
+
+        server.VoyagerClient.return_value.get_me.side_effect = get_me_then_clear
+        out = server.set_web_session("li", "js")
+        assert out.startswith("❌") and "cleared" in out
+        assert "work" not in store
+
+    def test_set_web_session_saves_when_not_cleared(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        server.VoyagerClient.return_value.get_me.return_value = {"first_name": "A", "last_name": "B", "headline": "h"}
+        out = server.set_web_session("li", "js")
+        assert out.startswith("✅") and store["work"]["li_at"] == "li"

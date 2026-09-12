@@ -66,7 +66,7 @@ Each alias has its own tier:
 | `OAUTH` | Valid OAuth token | All standard tools |
 | `VOYAGER` | OAuth token + browser session | All tools, including full profile, notifications, and conversations |
 
-> **Voyager is LinkedIn's unofficial, internal web API — not a supported developer surface.** Using it with your own session cookies is automated access that LinkedIn's [User Agreement](https://www.linkedin.com/legal/user-agreement) does not permit, and it can lead to warnings, temporary restrictions, or suspension of your LinkedIn account. It is **off by default**: nothing touches Voyager unless a web session (`li_at`) exists for the active alias, and every Voyager-backed tool degrades to the official API (or reports the missing session) when it does not. Use it knowingly, at your own risk, and only on your own account. See [SECURITY.md](SECURITY.md).
+> **Voyager is LinkedIn's unofficial, internal web API — not a supported developer surface.** Using it with your own session cookies is automated access that LinkedIn's [User Agreement](https://www.linkedin.com/legal/user-agreement) does not permit, and it can lead to warnings, temporary restrictions, or suspension of your LinkedIn account. It is **off by default**: nothing touches Voyager unless a web session (`li_at`) exists for the active alias, and every Voyager-backed tool degrades to the official API (or reports the missing session) when it does not. Use it knowingly, at your own risk, and only on your own account. See [SECURITY.md](https://github.com/PassoNova/mcp-linkedin-manager/blob/main/SECURITY.md).
 
 The Voyager tier uses the same internal API as LinkedIn's web app (`li_at` + `JSESSIONID` cookies). `authenticate` opens the LinkedIn login in a Playwright window on a per-account browser profile and reads the session from that profile once you approve the app, so no cookie copying is needed. If Playwright's Chromium cannot reach the network, the flow falls back to your system browser and Chrome's cookie store. `refresh_web_session` re-reads the profile at any time; `set_web_session` remains as a manual last resort. Set `LINKEDIN_AUTH_MODE=playwright|browser` to force one path.
 
@@ -314,7 +314,7 @@ The user registry (`~/.linkedin_mcp_users.json`) stores only alias names and the
 - Fallback files are created with mode `0600` (owner-read only) from the moment they exist; the per-alias Playwright profile directory (`~/.linkedin_mcp_browser_<alias>/`, which holds the live session cookie) and the log file (`~/.linkedin_mcp.log`) are kept owner-only (`0700` / `0600`).
 - The installers (`scripts/install.sh`, `setup.sh`) never pass the client secret to `claude mcp add`; that would persist it in plaintext in Claude's config. Store it with `python -m linkedin_mcp setup` instead.
 - `scripts/install.sh` verifies the release archive against the published `linkedin-mcp.plugin.sha256` and refuses to wipe `$HOME`, `/`, or a non-empty directory that is not a previous install.
-- See [SECURITY.md](SECURITY.md) for the threat model, the Voyager disclosure, and how to report a vulnerability.
+- See [SECURITY.md](https://github.com/PassoNova/mcp-linkedin-manager/blob/main/SECURITY.md) for the threat model, the Voyager disclosure, and how to report a vulnerability.
 - Never commit your `.env` file to version control. Delete it once credentials are in the keychain.
 - LinkedIn OAuth tokens expire after **60 days**. Re-run `authenticate` when prompted.
 - Browser session cookies (`li_at`, `JSESSIONID`) typically last ~1 year but are invalidated if you log out of linkedin.com.

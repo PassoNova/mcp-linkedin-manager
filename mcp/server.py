@@ -176,6 +176,34 @@ _voyager_session_keys: dict[str, str] = {}
 # Serialises singleton creation/eviction with profile removal, so a concurrent
 # tool call cannot re-open (or re-create) a profile while it is being deleted.
 _voyager_lock = threading.RLock()
+# Per-alias lifecycle generation: bumped by clear_web_session / logout. Flows
+# that own the profile for a while (OAuth login, set_web_session validation)
+# capture it first and only persist their cookies if it is unchanged, so a
+# clear that happened mid-flight cannot be undone by a late save.
+_session_generation: dict[str, int] = {}
+
+
+def _lifecycle_generation(alias: str) -> int:
+    with _voyager_lock:
+        return _session_generation.get(alias, 0)
+
+
+def _bump_generation(alias: str) -> None:
+    with _voyager_lock:
+        _session_generation[alias] = _session_generation.get(alias, 0) + 1
+
+
+def _save_session_if_current(li_at: str, jsessionid: str, alias: str, generation: int) -> bool:
+    """Persist the web session unless the alias was cleared since *generation* was read."""
+    with _voyager_lock:
+        if _session_generation.get(alias, 0) != generation:
+            _log.warning(
+                "Web session for '%s' was cleared while a login/validation was in progress; discarding it",
+                alias,
+            )
+            return False
+        save_web_session(li_at, jsessionid, alias)
+        return True
 
 
 def _remove_browser_profile(alias: str) -> bool:
@@ -329,6 +357,7 @@ async def authenticate(alias: str) -> str:
             client_id, client_secret = _credentials()
             # Release the persistent profile before the login window opens on it.
             _invalidate_voyager(alias)
+            generation = _lifecycle_generation(alias)
 
             result = await run_oauth_flow(
                 client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
@@ -344,9 +373,16 @@ async def authenticate(alias: str) -> str:
                 else "system browser + Chrome cookie store"
             )
 
+            if result.li_at and not _save_session_if_current(
+                result.li_at, result.jsessionid or "", alias, generation
+            ):
+                # clear_web_session / logout ran while the window was open.
+                result = result._replace(
+                    li_at=None,
+                    jsessionid=None,
+                    session_error="the web session was cleared while the login was in progress",
+                )
             if result.li_at:
-                with _voyager_lock:
-                    save_web_session(result.li_at, result.jsessionid or "", alias)
                 tier_note = (
                     "Voyager API enabled"
                     if result.jsessionid
@@ -396,6 +432,7 @@ def logout(alias: str = "") -> str:
         try:
             target = alias.strip() or _active_alias()
             with _voyager_lock:
+                _bump_generation(target)  # any in-flight login/validation must not save
                 _invalidate_voyager(target)  # release Chromium's lock on the profile first
                 _remove_browser_profile(target)
                 try:
@@ -650,6 +687,7 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
     with _tool_log("set_web_session"):
         try:
             active = _active_alias()
+            generation = _lifecycle_generation(active)
             bdir = _browser_dir(active)
             udd = bdir if has_browser_profile(bdir) else None
             _invalidate_voyager(active)  # the validation client opens the same profile
@@ -661,8 +699,11 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
                 vc.close()
             name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
             headline = me.get("headline", "")
-            with _voyager_lock:
-                save_web_session(li_at, jsessionid, active)
+            if not _save_session_if_current(li_at, jsessionid, active, generation):
+                return (
+                    f"❌ Not saved: the web session for '{active}' was cleared while it was "
+                    "being validated. Run `set_web_session` again if you still want it."
+                )
             _invalidate_voyager(active)
             _log.info("Web session saved for '%s' (verified as %s)", active, name)
             return (
@@ -736,6 +777,7 @@ def clear_web_session() -> str:
         try:
             active = _active_alias()
             with _voyager_lock:
+                _bump_generation(active)  # any in-flight login/validation must not save
                 _invalidate_voyager(active)  # release Chromium's lock on the profile first
                 # Profile first: if its removal fails, the stored session is left in
                 # place so a logged-in profile is never left behind for recovery.

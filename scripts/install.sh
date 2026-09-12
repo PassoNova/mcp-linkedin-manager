@@ -77,7 +77,19 @@ MARKER=".linkedin-mcp-install"
 MARKER_PREFIX="linkedin-mcp.plugin installed-by scripts/install.sh"
 INSTALL_DIR="${INSTALL_DIR%/}"
 [ -n "$INSTALL_DIR" ] || INSTALL_DIR="/"
-RESOLVED_DIR="$(cd "$INSTALL_DIR" 2>/dev/null && pwd -P || printf '%s' "$INSTALL_DIR")"
+case "/$INSTALL_DIR/" in
+    */../*|*/./*) err "Refusing INSTALL_DIR '$INSTALL_DIR': '.' or '..' path components are not allowed. Pass a plain absolute or ~-relative path." ;;
+esac
+# Canonicalise even when the target does not exist yet: resolve the nearest
+# existing parent and re-append the final component, so the guards below
+# see the real location.
+if [ -d "$INSTALL_DIR" ]; then
+    RESOLVED_DIR="$(cd "$INSTALL_DIR" && pwd -P)"
+else
+    PARENT_DIR="$(dirname "$INSTALL_DIR")"
+    [ -d "$PARENT_DIR" ] || err "Parent directory '$PARENT_DIR' does not exist. Create it first."
+    RESOLVED_DIR="$(cd "$PARENT_DIR" && pwd -P)/$(basename "$INSTALL_DIR")"
+fi
 HOME_DIR="$(cd "$HOME" && pwd -P)"
 SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)"
 

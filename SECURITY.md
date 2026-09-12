@@ -5,7 +5,8 @@
 Please do **not** open a public issue for security problems. Use GitHub's
 private vulnerability reporting on this repository (**Security → Report a
 vulnerability**). You will get an acknowledgement within a few days; fixes ship
-as a patch release and are noted under *Security* in `CHANGELOG.md`.
+as a patch release and are noted under *Security* in the
+[changelog](https://github.com/PassoNova/mcp-linkedin-manager/blob/main/CHANGELOG.md).
 
 Only the latest release is supported.
 

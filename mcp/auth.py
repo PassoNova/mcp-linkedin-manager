@@ -122,7 +122,12 @@ def ensure_private_dir(path: str) -> None:
 
     POSIX only: on Windows ``os.chmod`` cannot express an owner-only ACL, so
     there the guarantee is only what the per-user profile location provides.
+
+    A symlink at ``path`` is refused (``makedirs``/``chmod``/Chromium would all
+    follow it and put the live cookie somewhere else).
     """
+    if os.path.islink(path):
+        raise OSError(f"refusing to use {path} as a browser profile: it is a symlink")
     os.makedirs(path, mode=0o700, exist_ok=True)
     os.chmod(path, 0o700)
 
@@ -159,7 +164,11 @@ def _write_private_json(path: str, data: dict) -> None:
     written to it.
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    if os.path.islink(path):
+        raise OSError(f"refusing to write {path}: it is a symlink")
+    # O_NOFOLLOW makes the symlink refusal atomic where the platform has it.
+    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
     try:
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)

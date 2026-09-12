@@ -60,6 +60,29 @@ class TestPrivateDir:
         assert auth.has_browser_profile(str(tmp_path / "missing")) is False
         assert not (tmp_path / "missing").exists()
 
+    def test_symlinked_profile_dir_is_refused(self, tmp_path):
+        import auth
+        target = tmp_path / "elsewhere"
+        target.mkdir(mode=0o755)
+        link = tmp_path / "profile"
+        link.symlink_to(target)
+        with pytest.raises(OSError, match="symlink"):
+            auth.ensure_private_dir(str(link))
+        assert _mode(target) == 0o755  # untouched
+
+    def test_closed_voyager_client_never_reopens_profile(self, monkeypatch, tmp_path):
+        import client
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        monkeypatch.setattr(client, "_sync_playwright", MagicMock())
+        vc = client.VoyagerClient("L", "J", user_data_dir=str(profile))
+        vc.close()
+        import shutil
+        shutil.rmtree(profile)
+        with pytest.raises(RuntimeError, match="closed"):
+            vc._ensure_context()
+        assert not profile.exists()
+
     def test_harvest_chmods_existing_profile(self, monkeypatch, tmp_path):
         import auth
         (tmp_path / "Default").mkdir()
@@ -189,6 +212,16 @@ class TestPrivateFiles:
         with pytest.raises(OSError, match="symlink"):
             auth.load_web_session("work")
 
+    def test_write_refuses_symlinked_target(self, tmp_path):
+        import auth
+        real = tmp_path / "elsewhere.json"
+        real.write_text("keep")
+        link = tmp_path / "token.json"
+        link.symlink_to(real)
+        with pytest.raises(OSError, match="symlink"):
+            auth._write_private_json(str(link), {"a": 1})
+        assert real.read_text() == "keep"
+
     def test_write_private_json_creates_parent_dirs(self, tmp_path):
         import auth
         path = tmp_path / "nested" / "dir" / "f.json"
@@ -270,3 +303,13 @@ class TestLogFile:
             assert root.handlers == []
         finally:
             root.handlers[:] = saved
+
+    def test_symlinked_log_file_is_refused(self, tmp_path):
+        import log_config
+        real = tmp_path / "real.log"
+        real.write_text("keep\n")
+        link = tmp_path / "linkedin_mcp.log"
+        link.symlink_to(real)
+        with pytest.raises(OSError, match="symlink"):
+            log_config._PrivateRotatingFileHandler(str(link), maxBytes=0, backupCount=0, encoding="utf-8")
+        assert real.read_text() == "keep\n"

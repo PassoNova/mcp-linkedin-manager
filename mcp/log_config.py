@@ -43,7 +43,10 @@ class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
         self._tighten_backups()
 
     def _open(self):  # type: ignore[override]
-        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+        if os.path.islink(self.baseFilename):
+            raise OSError(f"refusing to log to {self.baseFilename}: it is a symlink")
+        # O_NOFOLLOW makes the symlink refusal atomic where the platform has it.
+        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
         if self.mode.startswith("w"):
             flags |= os.O_TRUNC
         fd = os.open(self.baseFilename, flags, 0o600)

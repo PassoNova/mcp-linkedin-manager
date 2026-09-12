@@ -367,6 +367,7 @@ class VoyagerClient:
         self._context: Any = None
         self._page: Any = None
         self._lock = threading.Lock()
+        self._closed = False  # set by close(); a closed client never reopens the profile
         # Single dedicated thread so Playwright sync API never runs inside asyncio.
         self._executor = ThreadPoolExecutor(max_workers=1)
 
@@ -389,6 +390,11 @@ class VoyagerClient:
         with self._lock:
             if self._context is not None:
                 return
+            if self._closed:
+                raise RuntimeError(
+                    "VoyagerClient is closed (the session was cleared or replaced); "
+                    "obtain a fresh client instead of reusing this one."
+                )
             if not self._user_data_dir:
                 raise RuntimeError(
                     "No persistent browser profile found. "
@@ -425,8 +431,13 @@ class VoyagerClient:
             _log.info("VoyagerClient: Playwright context ready at %s", self._user_data_dir)
 
     def close(self) -> None:
-        """Close the persistent browser context and release Playwright."""
+        """Close the persistent browser context and release Playwright.
+
+        The client is permanently closed afterwards: a stale reference held
+        across clear_web_session / logout cannot recreate the deleted profile.
+        """
         with self._lock:
+            self._closed = True
             try:
                 if self._page is not None:
                     self._page.close()
