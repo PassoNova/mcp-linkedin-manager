@@ -68,11 +68,13 @@ fi
 # ── Validate install directory ─────────────────────────────────────────────────
 # `rm -rf "$INSTALL_DIR"` below is only ever run against a directory that is
 # new, empty, or a previous install made by this script: it must carry the
-# $MARKER file this script writes after extraction (whose content must be a
-# release tag) AND the server entry point mcp/server.py. Nothing else is
-# accepted; installs that predate the marker must be removed by hand once.
+# $MARKER file this script writes after extraction — a regular file whose
+# entire content is the single line "$MARKER_PREFIX <release-tag>" — AND a
+# regular-file server entry point mcp/server.py. Nothing else is accepted;
+# installs that predate the marker must be removed by hand once.
 
 MARKER=".linkedin-mcp-install"
+MARKER_PREFIX="linkedin-mcp.plugin installed-by scripts/install.sh"
 INSTALL_DIR="${INSTALL_DIR%/}"
 [ -n "$INSTALL_DIR" ] || INSTALL_DIR="/"
 RESOLVED_DIR="$(cd "$INSTALL_DIR" 2>/dev/null && pwd -P || printf '%s' "$INSTALL_DIR")"
@@ -99,9 +101,11 @@ if [ -d "$INSTALL_DIR" ]; then
         if [ -e "$INSTALL_DIR/.git" ]; then
             err "'$INSTALL_DIR' is a git checkout. Refusing to delete it — install into a dedicated directory instead."
         fi
-        if [ -f "$INSTALL_DIR/$MARKER" ] && [ -f "$INSTALL_DIR/mcp/server.py" ] \
-           && grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+' "$INSTALL_DIR/$MARKER"; then
-            info "Found previous linkedin-mcp install ($(head -1 "$INSTALL_DIR/$MARKER")) — it will be replaced."
+        if [ -f "$INSTALL_DIR/$MARKER" ] && [ ! -L "$INSTALL_DIR/$MARKER" ] \
+           && [ -f "$INSTALL_DIR/mcp/server.py" ] && [ ! -L "$INSTALL_DIR/mcp/server.py" ] \
+           && [ "$(wc -l < "$INSTALL_DIR/$MARKER")" -eq 1 ] \
+           && grep -Exq "$MARKER_PREFIX v?[0-9]+\.[0-9]+\.[0-9]+" "$INSTALL_DIR/$MARKER"; then
+            info "Found previous linkedin-mcp install ($(awk '{print $NF}' "$INSTALL_DIR/$MARKER")) — it will be replaced."
         elif [ -f "$INSTALL_DIR/mcp/server.py" ]; then
             err "'$INSTALL_DIR' looks like a linkedin-mcp install made before installs were marked. Refusing to delete it automatically — check its contents, then remove it yourself (rm -rf '$INSTALL_DIR') and re-run."
         else
@@ -159,7 +163,7 @@ info "Installing to $INSTALL_DIR…"
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 unzip -q "$TMP_PLUGIN" -d "$INSTALL_DIR"
-printf '%s\n' "$VERSION" > "$INSTALL_DIR/$MARKER"
+printf '%s %s\n' "$MARKER_PREFIX" "$VERSION" > "$INSTALL_DIR/$MARKER"
 ok "Extracted plugin files"
 
 info "Installing Python dependencies…"

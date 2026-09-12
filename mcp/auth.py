@@ -128,17 +128,25 @@ def ensure_private_dir(path: str) -> None:
 
 
 def _tighten_private_file(path: str) -> None:
-    """Re-apply 0600 to an existing fallback file before it is read.
+    """Re-apply 0600 to an existing fallback file.
 
     Files written by older versions may still be 0644; reading them is the
-    common path (writes only happen at login), so tighten here as well.
+    common path (writes only happen at login), so tighten on every load —
+    including loads served from the keychain, so a stale file copy is fixed
+    too. Fails closed: if the mode cannot be applied the caller must not use
+    the file (``OSError`` is raised, mirroring the log handler).
     """
-    if not os.path.exists(path):
+    if not os.path.lexists(path):
         return
+    if os.path.islink(path):
+        raise OSError(f"refusing to use {path}: it is a symlink")
     try:
         os.chmod(path, 0o600)
     except OSError as exc:
-        _log.warning("Could not make %s owner-only: %s", path, exc)
+        raise OSError(
+            f"refusing to use {path}: cannot make it owner-only ({exc}); "
+            "fix its ownership/permissions or delete it"
+        ) from exc
 
 
 def _write_private_json(path: str, data: dict) -> None:
@@ -1035,6 +1043,8 @@ def save_token(token_data: dict, alias: str) -> None:
 def load_token(alias: str) -> Optional[dict]:
     """Load saved token for alias, checking OS keychain first then file."""
     key = f"{_KR_KEY_TOKEN}:{alias}"
+    path = _token_path(alias)
+    _tighten_private_file(path)  # even on a keychain hit a stale file copy gets fixed
     if _HAS_KEYRING:
         try:
             raw = keyring.get_password(_KR_SERVICE, key)
@@ -1042,10 +1052,8 @@ def load_token(alias: str) -> Optional[dict]:
                 return json.loads(raw)
         except Exception:
             pass
-    path = _token_path(alias)
     if not os.path.exists(path):
         return None
-    _tighten_private_file(path)
     with open(path) as fh:
         return json.load(fh)
 
@@ -1062,22 +1070,48 @@ def is_token_expired(token_data: dict, buffer_seconds: int = 300) -> bool:
     return time.time() >= (obtained_at + expires_in - buffer_seconds)
 
 
-def delete_token(alias: str) -> bool:
-    """Remove saved token for alias from keychain and/or file. Returns True if anything deleted."""
-    key = f"{_KR_KEY_TOKEN}:{alias}"
+def _delete_secret(kind: str, key: str, path: str, alias: str, strict: bool) -> bool:
+    """Shared body of delete_token / delete_web_session.
+
+    Removes the fallback file first, then the keychain entry. With ``strict``
+    a keychain failure raises ``RuntimeError`` unless a read confirms the
+    entry is absent, so callers can only report success when nothing is left.
+    """
     deleted = False
+    if os.path.exists(path):
+        os.remove(path)
+        deleted = True
     if _HAS_KEYRING:
         try:
             keyring.delete_password(_KR_SERVICE, key)
             deleted = True
-        except Exception:
-            pass
-    path = _token_path(alias)
-    if os.path.exists(path):
-        os.remove(path)
-        deleted = True
-    _log.debug("Token for '%s' deleted: %s", alias, deleted)
+        except Exception as exc:
+            if strict:
+                # keyring raises for a missing entry too — accept only if a
+                # read confirms it is really gone.
+                try:
+                    still_there = keyring.get_password(_KR_SERVICE, key) is not None
+                except Exception as read_exc:
+                    raise RuntimeError(
+                        f"keychain unavailable while clearing the {kind} for '{alias}': {read_exc}"
+                    ) from read_exc
+                if still_there:
+                    raise RuntimeError(
+                        f"keychain refused to delete the {kind} for '{alias}': {exc}"
+                    ) from exc
+            else:
+                _log.debug("Keychain delete of %s for '%s' failed: %s", kind, alias, exc)
+    _log.debug("%s for '%s' deleted: %s", kind.capitalize(), alias, deleted)
     return deleted
+
+
+def delete_token(alias: str, *, strict: bool = False) -> bool:
+    """Remove saved token for alias from keychain and/or file. Returns True if anything deleted.
+
+    ``strict=True`` raises ``RuntimeError`` on an unverifiable keychain failure
+    (see ``_delete_secret``); ``logout`` relies on it.
+    """
+    return _delete_secret("OAuth token", f"{_KR_KEY_TOKEN}:{alias}", _token_path(alias), alias, strict)
 
 
 # ── Web session persistence (Voyager cookies, per-user) ───────────────────────
@@ -1101,6 +1135,8 @@ def save_web_session(li_at: str, jsessionid: str, alias: str) -> None:
 def load_web_session(alias: str) -> Optional[dict]:
     """Load saved web session cookies for alias, checking keychain first then file."""
     key = f"{_KR_KEY}:{alias}"
+    path = _session_path(alias)
+    _tighten_private_file(path)  # even on a keychain hit a stale file copy gets fixed
     if _HAS_KEYRING:
         try:
             raw = keyring.get_password(_KR_SERVICE, key)
@@ -1108,10 +1144,8 @@ def load_web_session(alias: str) -> Optional[dict]:
                 return json.loads(raw)
         except Exception:
             pass
-    path = _session_path(alias)
     if not os.path.exists(path):
         return None
-    _tighten_private_file(path)
     with open(path) as fh:
         return json.load(fh)
 
@@ -1124,36 +1158,7 @@ def delete_web_session(alias: str, *, strict: bool = False) -> bool:
     is raised. ``clear_web_session`` uses this so it never reports success
     while a live ``li_at`` still sits in the keychain.
     """
-    key = f"{_KR_KEY}:{alias}"
-    deleted = False
-    # Fallback file first, so a keychain failure raised below never leaves the
-    # file copy behind.
-    path = _session_path(alias)
-    if os.path.exists(path):
-        os.remove(path)
-        deleted = True
-    if _HAS_KEYRING:
-        try:
-            keyring.delete_password(_KR_SERVICE, key)
-            deleted = True
-        except Exception as exc:
-            if strict:
-                # keyring raises for a missing entry too — accept only if a
-                # read confirms it is really gone.
-                try:
-                    still_there = keyring.get_password(_KR_SERVICE, key) is not None
-                except Exception as read_exc:
-                    raise RuntimeError(
-                        f"keychain unavailable while clearing the web session for '{alias}': {read_exc}"
-                    ) from read_exc
-                if still_there:
-                    raise RuntimeError(
-                        f"keychain refused to delete the web session for '{alias}': {exc}"
-                    ) from exc
-            else:
-                _log.debug("Keychain delete for '%s' failed: %s", alias, exc)
-    _log.debug("Web session for '%s' deleted: %s", alias, deleted)
-    return deleted
+    return _delete_secret("web session", f"{_KR_KEY}:{alias}", _session_path(alias), alias, strict)
 
 
 # ── App credential persistence ─────────────────────────────────────────────────

@@ -61,6 +61,12 @@ claude mcp add linkedin-manager \
 
 # ── 6. Store app credentials in the OS keychain ──────────────────────────────
 echo ""
+if [ -n "${LINKEDIN_CLIENT_ID:-}" ] || [ -n "${LINKEDIN_CLIENT_SECRET:-}" ]; then
+    echo "⚠️  LINKEDIN_CLIENT_ID / LINKEDIN_CLIENT_SECRET are set in this shell but are NOT"
+    echo "   persisted or registered by this script (that would store the secret in"
+    echo "   plaintext in Claude's config). Store them in the keychain instead:"
+    echo "     cd $MCP_DIR && uv run python -m linkedin_mcp setup"
+fi
 if [ -f "$ENV_FILE" ] && grep -qE '^LINKEDIN_CLIENT_SECRET=.+' "$ENV_FILE"; then
     echo "ℹ️  Found $ENV_FILE — the server reads it as a fallback; run the setup"
     echo "   wizard below to move the credentials into the keychain, then delete the file."

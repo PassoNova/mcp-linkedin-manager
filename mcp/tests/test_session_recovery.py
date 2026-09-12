@@ -217,10 +217,25 @@ class TestLogoutRemovesProfile:
         server, store, tmp_path = srv
         profile = _make_profile(tmp_path)
         calls = []
-        monkeypatch.setattr(server, "delete_token", lambda alias: calls.append(("token", alias)))
+        monkeypatch.setattr(server, "delete_token", lambda alias, **kw: calls.append(("token", alias)))
         monkeypatch.setattr(server, "delete_web_session", lambda alias, **kw: calls.append(("session", alias)))
         monkeypatch.setattr(server, "deregister_alias", lambda alias: calls.append(("dereg", alias)))
         out = server.logout("work")
         assert out.startswith("✅")
         assert not profile.exists()
         assert calls == [("token", "work"), ("session", "work"), ("dereg", "work")]
+
+    def test_logout_keeps_alias_when_keychain_delete_fails(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        _make_profile(tmp_path)
+        dereg = MagicMock()
+        monkeypatch.setattr(server, "delete_token", lambda alias, **kw: True)
+
+        def failing(alias, **kw):
+            raise RuntimeError("keychain refused to delete the web session for 'work': locked")
+
+        monkeypatch.setattr(server, "delete_web_session", failing)
+        monkeypatch.setattr(server, "deregister_alias", dereg)
+        out = server.logout("work")
+        assert out.startswith("❌") and "locked" in out
+        dereg.assert_not_called()

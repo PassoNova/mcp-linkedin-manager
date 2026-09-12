@@ -199,6 +199,12 @@ def _remove_browser_profile(alias: str) -> bool:
 
 
 def _recover_session_from_profile(alias: str) -> Optional[dict]:
+    """Re-read the LinkedIn session from the alias's persistent Playwright profile (locked)."""
+    with _voyager_lock:
+        return _recover_session_from_profile_unlocked(alias)
+
+
+def _recover_session_from_profile_unlocked(alias: str) -> Optional[dict]:
     """Re-read the LinkedIn session from the alias's persistent Playwright profile.
 
     Runs when no web session is saved but a profile exists (e.g. the login
@@ -339,7 +345,8 @@ async def authenticate(alias: str) -> str:
             )
 
             if result.li_at:
-                save_web_session(result.li_at, result.jsessionid or "", alias)
+                with _voyager_lock:
+                    save_web_session(result.li_at, result.jsessionid or "", alias)
                 tier_note = (
                     "Voyager API enabled"
                     if result.jsessionid
@@ -391,8 +398,18 @@ def logout(alias: str = "") -> str:
             with _voyager_lock:
                 _invalidate_voyager(target)  # release Chromium's lock on the profile first
                 _remove_browser_profile(target)
-                delete_token(target)
-                delete_web_session(target)
+                try:
+                    # strict: keychain failures raise instead of being swallowed, so
+                    # the alias is only deregistered once both entries are gone.
+                    delete_token(target, strict=True)
+                    delete_web_session(target, strict=True)
+                except RuntimeError as exc:
+                    _log.warning("logout: %s", exc)
+                    return (
+                        f"❌ '{target}' NOT logged out: {exc}. The alias stays registered; "
+                        f"fix the keychain (or delete the `linkedin-mcp` entries for "
+                        f"'{target}' manually) and run `logout` again."
+                    )
             deregister_alias(target)
             _log.info("Logged out '%s'", target)
             return f"✅ '{target}' logged out and removed."
@@ -644,7 +661,8 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
                 vc.close()
             name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
             headline = me.get("headline", "")
-            save_web_session(li_at, jsessionid, active)
+            with _voyager_lock:
+                save_web_session(li_at, jsessionid, active)
             _invalidate_voyager(active)
             _log.info("Web session saved for '%s' (verified as %s)", active, name)
             return (
@@ -682,15 +700,16 @@ def refresh_web_session() -> str:
                     f"❌ No browser profile for '{active}'. Run `authenticate` first "
                     "(the Playwright login window creates it)."
                 )
-            _invalidate_voyager(active)  # Chromium locks the profile; free it first
-            li_at, jsessionid, err = _run_in_thread(harvest_session_from_profile, bdir)
-            if not li_at:
-                return (
-                    f"❌ Could not recover a session from the browser profile ({err}).\n"
-                    "   Run `authenticate` again and log in inside the window that opens, "
-                    "or use `set_web_session`."
-                )
-            save_web_session(li_at, jsessionid or "", active)
+            with _voyager_lock:  # never interleave with clear_web_session / logout
+                _invalidate_voyager(active)  # Chromium locks the profile; free it first
+                li_at, jsessionid, err = _run_in_thread(harvest_session_from_profile, bdir)
+                if not li_at:
+                    return (
+                        f"❌ Could not recover a session from the browser profile ({err}).\n"
+                        "   Run `authenticate` again and log in inside the window that opens, "
+                        "or use `set_web_session`."
+                    )
+                save_web_session(li_at, jsessionid or "", active)
             _log.info("Web session refreshed for '%s' from browser profile", active)
             return (
                 f"✅ Web session refreshed for '{active}' from the browser profile.\n"

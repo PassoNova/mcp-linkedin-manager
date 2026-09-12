@@ -498,3 +498,27 @@ class TestDeleteWebSessionStrict:
         with pytest.raises(RuntimeError):
             auth.delete_web_session("work", strict=True)
         assert not path.exists()
+
+
+class TestDeleteTokenStrict:
+    def test_strict_raises_when_entry_survives(self, tmp_path, monkeypatch):
+        import auth, pytest
+        monkeypatch.setattr(auth, "_HAS_KEYRING", True)
+        mock_kr = MagicMock()
+        mock_kr.delete_password.side_effect = RuntimeError("locked")
+        mock_kr.get_password.return_value = '{"access_token": "x"}'
+        monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / "tok.json"))
+        (tmp_path / "tok.json").write_text("{}")
+        with pytest.raises(RuntimeError, match="OAuth token"):
+            auth.delete_token("work", strict=True)
+        assert not (tmp_path / "tok.json").exists()  # file copy removed first
+
+    def test_non_strict_unchanged(self, tmp_path, monkeypatch):
+        import auth
+        monkeypatch.setattr(auth, "_HAS_KEYRING", True)
+        mock_kr = MagicMock()
+        mock_kr.delete_password.side_effect = RuntimeError("locked")
+        monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / "none.json"))
+        assert auth.delete_token("work") is False

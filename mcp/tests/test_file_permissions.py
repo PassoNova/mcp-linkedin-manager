@@ -154,6 +154,41 @@ class TestPrivateFiles:
         assert auth.load_web_session("work")["li_at"] == "L"
         assert _mode(tok) == 0o600 and _mode(ses) == 0o600
 
+    def test_loose_file_is_tightened_even_on_keychain_hit(self, tmp_path, monkeypatch):
+        import auth
+        tok = tmp_path / "token_work.json"
+        tok.write_text('{"access_token": "stale"}')
+        os.chmod(tok, 0o644)
+        monkeypatch.setattr(auth, "_HAS_KEYRING", True)
+        kr = MagicMock()
+        kr.get_password.return_value = '{"access_token": "from-keychain"}'
+        monkeypatch.setattr(auth, "keyring", kr)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tok))
+        assert auth.load_token("work")["access_token"] == "from-keychain"
+        assert _mode(tok) == 0o600
+
+    def test_load_fails_closed_when_file_cannot_be_tightened(self, tmp_path, monkeypatch):
+        import auth
+        tok = tmp_path / "token_work.json"
+        tok.write_text('{"access_token": "x"}')
+        os.chmod(tok, 0o644)
+        monkeypatch.setattr(auth, "_HAS_KEYRING", False)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tok))
+        monkeypatch.setattr(os, "chmod", MagicMock(side_effect=PermissionError("ro")))
+        with pytest.raises(OSError, match="owner-only"):
+            auth.load_token("work")
+
+    def test_symlinked_fallback_file_is_refused(self, tmp_path, monkeypatch):
+        import auth
+        real = tmp_path / "elsewhere.json"
+        real.write_text('{"li_at": "L"}')
+        link = tmp_path / "session_work.json"
+        link.symlink_to(real)
+        monkeypatch.setattr(auth, "_HAS_KEYRING", False)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(link))
+        with pytest.raises(OSError, match="symlink"):
+            auth.load_web_session("work")
+
     def test_write_private_json_creates_parent_dirs(self, tmp_path):
         import auth
         path = tmp_path / "nested" / "dir" / "f.json"
