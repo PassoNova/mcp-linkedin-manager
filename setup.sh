@@ -46,37 +46,11 @@ echo "▶ Verifying server syntax..."
 uv run python -m py_compile server.py auth.py client.py
 echo "✅ Server syntax OK"
 
-# ── 5. Read credentials ───────────────────────────────────────────────────────
-echo ""
-# Prefer ~/.linkedin_mcp.env (plugin standard location)
-if [ -f "$HOME/.linkedin_mcp.env" ]; then
-    ENV_FILE="$HOME/.linkedin_mcp.env"
-    echo "✅ Using credentials from ~/.linkedin_mcp.env"
-elif [ -f "$PROJECT_DIR/.env" ]; then
-    ENV_FILE="$PROJECT_DIR/.env"
-    echo "✅ Using credentials from .env"
-else
-    echo "⚠️  No credentials file found."
-    echo "   Create ~/.linkedin_mcp.env with:"
-    echo "     LINKEDIN_CLIENT_ID=your_id"
-    echo "     LINKEDIN_CLIENT_SECRET=your_secret"
-    echo "   Then re-run this script."
-    exit 1
-fi
-
-CLIENT_ID=$(grep -E '^LINKEDIN_CLIENT_ID=' "$ENV_FILE" | cut -d= -f2- | tr -d ' "')
-CLIENT_SECRET=$(grep -E '^LINKEDIN_CLIENT_SECRET=' "$ENV_FILE" | cut -d= -f2- | tr -d ' "')
-
-if [ -z "$CLIENT_ID" ] || [ "$CLIENT_ID" = "your_client_id_here" ]; then
-    echo "❌ LINKEDIN_CLIENT_ID is not set. Please fill it in and re-run."
-    exit 1
-fi
-if [ -z "$CLIENT_SECRET" ] || [ "$CLIENT_SECRET" = "your_client_secret_here" ]; then
-    echo "❌ LINKEDIN_CLIENT_SECRET is not set. Please fill it in and re-run."
-    exit 1
-fi
-
-# ── 6. Register with Claude Code CLI ─────────────────────────────────────────
+# ── 5. Register with Claude Code CLI ─────────────────────────────────────────
+# No credentials are passed on the command line or stored in Claude's config:
+# `claude mcp add --env` would persist the client secret in plaintext. The
+# server reads them from the OS keychain (`python -m linkedin_mcp setup`), or
+# from LINKEDIN_CLIENT_ID / LINKEDIN_CLIENT_SECRET in its own environment.
 VENV_PYTHON="$MCP_DIR/.venv/bin/python"
 
 echo ""
@@ -85,9 +59,21 @@ claude mcp remove linkedin-manager 2>/dev/null && echo "   (removed previous reg
 
 claude mcp add linkedin-manager \
     --scope user \
-    -e LINKEDIN_CLIENT_ID="$CLIENT_ID" \
-    -e LINKEDIN_CLIENT_SECRET="$CLIENT_SECRET" \
     -- "$VENV_PYTHON" "$MCP_DIR/server.py"
+
+# ── 6. Store app credentials in the OS keychain ──────────────────────────────
+echo ""
+if [ -f "$ENV_FILE" ] && grep -qE '^LINKEDIN_CLIENT_SECRET=.+' "$ENV_FILE"; then
+    echo "ℹ️  Found $ENV_FILE — the server reads it as a fallback; run the setup"
+    echo "   wizard below to move the credentials into the keychain, then delete the file."
+fi
+if [ -t 0 ]; then
+    echo "▶ Storing LinkedIn app credentials in the OS keychain..."
+    uv run python -m linkedin_mcp setup
+else
+    echo "⚠️  Non-interactive shell — skipping credential setup. Run this later:"
+    echo "     cd $MCP_DIR && uv run python -m linkedin_mcp setup"
+fi
 
 echo ""
 echo "╔══════════════════════════════════════════╗"
