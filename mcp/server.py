@@ -37,6 +37,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import threading
 import time
 from contextlib import contextmanager
 from textwrap import dedent
@@ -59,6 +61,7 @@ from auth import (
     delete_web_session,
     get_active_alias,
     harvest_session_from_profile,
+    ensure_private_dir,
     has_browser_profile,
     is_token_expired,
     load_credentials,
@@ -78,9 +81,39 @@ from client import LinkedInClient, VoyagerClient
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────
 
-load_dotenv()
-
 _log = logging.getLogger("linkedin_mcp.server")
+
+
+def _load_env_files() -> Optional[str]:
+    """Load ``mcp/.env``; fall back to a legacy repository-root ``.env`` only if it is absent.
+
+    The generic ``load_dotenv()`` searched upward from this file, so installs
+    that predate the ``mcp/.env`` convention kept their app credentials in the
+    repository root and still worked. That exact behaviour is preserved (the
+    root file is read only when ``mcp/.env`` does not exist) so an upgrade
+    does not silently drop the official OAuth path; the fallback is logged as
+    deprecated so the user migrates it to the keychain. Returns the path that
+    was loaded, or None.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    primary = os.path.join(here, ".env")
+    if os.path.isfile(primary):
+        load_dotenv(primary)
+        return primary
+    legacy = os.path.join(os.path.dirname(here), ".env")
+    if os.path.isfile(legacy):
+        load_dotenv(legacy)
+        _log.warning(
+            "Loaded credentials from the legacy repository-root .env (%s). This fallback is "
+            "deprecated: store them in the keychain with `python -m linkedin_mcp setup` "
+            "(run from mcp/ with `uv run`) and delete the file, or move it to mcp/.env.",
+            legacy,
+        )
+        return legacy
+    return None
+
+
+_load_env_files()
 
 
 def _git_version() -> str:
@@ -171,9 +204,95 @@ def _get_client(alias: Optional[str] = None) -> LinkedInClient:
 
 _voyager_singletons: dict[str, VoyagerClient] = {}
 _voyager_session_keys: dict[str, str] = {}
+# Per-alias lifecycle locks: serialise singleton creation/eviction, session
+# persistence and profile removal for one account, so a concurrent tool call
+# cannot re-open (or re-create) a profile while it is being deleted — without a
+# slow profile for one alias blocking every other alias.
+_alias_locks: dict[str, threading.RLock] = {}
+_alias_locks_guard = threading.Lock()
+# Per-alias lifecycle generation: bumped by clear_web_session / logout. Flows
+# that own the profile for a while (OAuth login, set_web_session validation)
+# capture it first and only persist their cookies if it is unchanged, so a
+# clear that happened mid-flight cannot be undone by a late save.
+_session_generation: dict[str, int] = {}
+# Aliases cleared/logged out since the last persisted session. While an alias
+# is here, profile recovery is refused: a profile can only exist because a flow
+# that was in progress during the clear (re)created it, and its cookies must
+# not silently re-enable Voyager. Persisting a session again lifts it.
+_cleared_pending: set[str] = set()
+
+
+def _alias_lock(alias: str) -> threading.RLock:
+    with _alias_locks_guard:
+        lock = _alias_locks.get(alias)
+        if lock is None:
+            lock = _alias_locks[alias] = threading.RLock()
+        return lock
+
+
+def _lifecycle_generation(alias: str) -> int:
+    with _alias_lock(alias):
+        return _session_generation.get(alias, 0)
+
+
+def _bump_generation(alias: str) -> None:
+    """Mark the alias as cleared: invalidates in-flight saves and blocks profile recovery."""
+    with _alias_lock(alias):
+        _session_generation[alias] = _session_generation.get(alias, 0) + 1
+        _cleared_pending.add(alias)
+
+
+def _session_persisted(alias: str) -> None:
+    """A session was (re)stored on purpose; profile recovery is allowed again."""
+    with _alias_lock(alias):
+        _cleared_pending.discard(alias)
+
+
+def _save_session_if_current(li_at: str, jsessionid: str, alias: str, generation: int) -> bool:
+    """Persist the web session unless the alias was cleared since *generation* was read."""
+    with _alias_lock(alias):
+        if _session_generation.get(alias, 0) != generation:
+            _log.warning(
+                "Web session for '%s' was cleared while a login/validation was in progress; discarding it",
+                alias,
+            )
+            return False
+        save_web_session(li_at, jsessionid, alias)
+        _session_persisted(alias)
+        return True
+
+
+def _remove_browser_profile(alias: str) -> bool:
+    """Delete the alias's persistent Playwright profile. Returns True if one was removed.
+
+    The alias comes from the persisted registry, so it is re-validated here and
+    the path must be a real directory (not a symlink) before ``rmtree`` runs.
+    """
+    try:
+        validate_alias(alias)
+    except ValueError as exc:
+        raise ValueError(f"refusing to remove a browser profile for invalid alias {alias!r}: {exc}") from exc
+    bdir = _browser_dir(alias)
+    if os.path.islink(bdir):
+        raise ValueError(f"refusing to remove {bdir}: it is a symlink")
+    if not os.path.lexists(bdir):
+        return False
+    if not os.path.isdir(bdir):
+        # Fail closed: something is at the profile path but it is not a directory,
+        # so "removed" cannot honestly be reported. Leave it for the operator.
+        raise ValueError(f"refusing to remove {bdir}: it exists but is not a directory")
+    shutil.rmtree(bdir)
+    _log.info("Browser profile removed for '%s' (%s)", alias, bdir)
+    return True
 
 
 def _recover_session_from_profile(alias: str) -> Optional[dict]:
+    """Re-read the LinkedIn session from the alias's persistent Playwright profile (locked)."""
+    with _alias_lock(alias):
+        return _recover_session_from_profile_unlocked(alias)
+
+
+def _recover_session_from_profile_unlocked(alias: str) -> Optional[dict]:
     """Re-read the LinkedIn session from the alias's persistent Playwright profile.
 
     Runs when no web session is saved but a profile exists (e.g. the login
@@ -181,6 +300,9 @@ def _recover_session_from_profile(alias: str) -> Optional[dict]:
     or the session entry was cleared). Persists what it finds so the next call
     is a plain keychain read. Returns the session dict or None.
     """
+    if alias in _cleared_pending:
+        _log.info("Not recovering a session for '%s': it was cleared and not re-authenticated", alias)
+        return None
     bdir = _browser_dir(alias)
     if not has_browser_profile(bdir):
         return None
@@ -194,8 +316,31 @@ def _recover_session_from_profile(alias: str) -> Optional[dict]:
     return load_web_session(alias)
 
 
-def _get_voyager_client(alias: Optional[str] = None) -> Optional[VoyagerClient]:
-    """Return a reusable VoyagerClient for alias, creating one only when session changes."""
+def _get_voyager_client(alias: Optional[str] = None, *, optional: bool = False) -> Optional[VoyagerClient]:
+    """Return a reusable VoyagerClient for alias, creating one only when session changes.
+
+    With ``optional=True`` (tools that only *enrich* an official-API answer:
+    ``get_profile``, ``update_headline``) an unusable session file or browser
+    profile — symlinked, wrong owner, mode that cannot be tightened — is
+    reported as "Voyager unavailable" (``None``) instead of raised, so the
+    documented OAuth fallback still runs. The unsafe file or profile is still
+    refused (never opened, never deleted). Tools that *require* Voyager keep
+    the exception so the user sees what to fix.
+    """
+    alias = alias or _active_alias()
+    with _alias_lock(alias):
+        if not optional:
+            return _get_voyager_client_unlocked(alias)
+        try:
+            return _get_voyager_client_unlocked(alias)
+        except (OSError, RuntimeError) as exc:
+            _log.warning(
+                "Voyager unavailable for '%s' (%s); using the official API only", alias, exc
+            )
+            return None
+
+
+def _get_voyager_client_unlocked(alias: Optional[str] = None) -> Optional[VoyagerClient]:
     alias = alias or _active_alias()
     session = load_web_session(alias)
     if not session:
@@ -204,6 +349,19 @@ def _get_voyager_client(alias: Optional[str] = None) -> Optional[VoyagerClient]:
         _log.debug("No web session for '%s'; Voyager unavailable", alias)
         return None
     key = session.get("li_at", "")
+    existing = _voyager_singletons.get(alias)
+    if existing is not None and getattr(existing, "_closed", False):
+        # close() marked it permanently closed (possibly after a teardown timeout);
+        # never hand it out again. Retry the teardown, then rebuild below.
+        try:
+            existing.close()
+        except Exception as exc:
+            _log.warning("VoyagerClient for '%s' still closing (%s); not replacing it yet", alias, exc)
+            raise RuntimeError(
+                "The previous Voyager session is still shutting down; try again in a moment."
+            ) from exc
+        del _voyager_singletons[alias]
+        _voyager_session_keys.pop(alias, None)
     if alias not in _voyager_singletons or key != _voyager_session_keys.get(alias):
         if alias in _voyager_singletons:
             _log.debug("Session changed for '%s'; recycling VoyagerClient", alias)
@@ -224,6 +382,16 @@ def _get_voyager_client(alias: Optional[str] = None) -> Optional[VoyagerClient]:
 
 def _invalidate_voyager(alias: Optional[str] = None) -> None:
     """Close and evict Voyager singleton(s). Pass alias to target one; None clears all."""
+    if alias is None:
+        for known in list(_voyager_singletons):
+            with _alias_lock(known):
+                _invalidate_voyager_unlocked(known)
+        return
+    with _alias_lock(alias):
+        _invalidate_voyager_unlocked(alias)
+
+
+def _invalidate_voyager_unlocked(alias: Optional[str] = None) -> None:
     if alias is not None:
         if alias in _voyager_singletons:
             _log.debug("Invalidating VoyagerClient for '%s'", alias)
@@ -287,13 +455,40 @@ async def authenticate(alias: str) -> str:
             validate_alias(alias)
             client_id, client_secret = _credentials()
             # Release the persistent profile before the login window opens on it.
-            _invalidate_voyager(alias)
+            with _alias_lock(alias):
+                # Release the profile and snapshot the generation under one lock, so a
+                # clear/logout cannot slip between the two and be missed later.
+                _invalidate_voyager_unlocked(alias)
+                generation = _session_generation.get(alias, 0)
 
-            result = await run_oauth_flow(
-                client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
-            )
-            save_token(result.token_data, alias)
-            register_alias(alias)
+            try:
+                result = await run_oauth_flow(
+                    client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
+                )
+            except Exception:
+                # The flow failed (timeout, closed window, denied consent) but may still
+                # have written cookies into the profile. If a clear/logout happened while
+                # the window was open, that profile must not survive the clear.
+                with _alias_lock(alias):
+                    if _session_generation.get(alias, 0) != generation:
+                        _remove_browser_profile(alias)
+                        _log.warning(
+                            "authenticate('%s') failed after a mid-flight clear; profile removed", alias
+                        )
+                raise
+            with _alias_lock(alias):
+                if _lifecycle_generation(alias) != generation:
+                    # clear_web_session / logout ran while the window was open: persist
+                    # nothing (token, registry, cookies) and drop whatever the flow
+                    # wrote into the profile in the meantime.
+                    _remove_browser_profile(alias)
+                    _log.warning("authenticate('%s') discarded: cleared/logged out mid-flight", alias)
+                    return (
+                        f"❌ Login discarded: '{alias}' was cleared or logged out while the "
+                        "login window was open. Run `authenticate` again."
+                    )
+                save_token(result.token_data, alias)
+                register_alias(alias)
 
             scopes = result.token_data.get("scope", "unknown")
             expires_in = result.token_data.get("expires_in", "unknown")
@@ -303,8 +498,41 @@ async def authenticate(alias: str) -> str:
                 else "system browser + Chrome cookie store"
             )
 
+            if result.li_at and not _save_session_if_current(
+                result.li_at, result.jsessionid or "", alias, generation
+            ):
+                # clear_web_session / logout ran while the window was open.
+                result = result._replace(
+                    li_at=None,
+                    jsessionid=None,
+                    session_error="the web session was cleared while the login was in progress",
+                )
+            with _alias_lock(alias):
+                # Final check after every write. Any generation change means a clear or a
+                # logout completed while the login was in progress: the web session it
+                # captured is gone. A logout has also deleted the token and deregistered
+                # the alias, so nothing persisted and reporting success would be a lie;
+                # a plain clear keeps the OAuth token and only loses the web session.
+                if _session_generation.get(alias, 0) != generation:
+                    # A logout that failed halfway can leave the alias registered with
+                    # the token already gone; treat a missing token like a logout too.
+                    if (
+                        alias not in load_user_registry().get("aliases", [])
+                        or load_token(alias) is None
+                    ):
+                        _remove_browser_profile(alias)
+                        delete_token(alias)
+                        _log.warning("authenticate('%s') discarded: logged out mid-flight", alias)
+                        return (
+                            f"❌ Login discarded: '{alias}' was logged out while the login was in "
+                            "progress, so nothing was saved. Run `authenticate` again."
+                        )
+                    result = result._replace(
+                        li_at=None,
+                        jsessionid=None,
+                        session_error="the web session was cleared while the login was in progress",
+                    )
             if result.li_at:
-                save_web_session(result.li_at, result.jsessionid or "", alias)
                 tier_note = (
                     "Voyager API enabled"
                     if result.jsessionid
@@ -344,7 +572,8 @@ async def authenticate(alias: str) -> str:
 @mcp.tool()
 def logout(alias: str = "") -> str:
     """
-    Remove a user's credentials and unregister the alias.
+    Remove a user's credentials — OAuth token, web session cookies and the
+    logged-in browser profile — and unregister the alias.
 
     Args:
         alias: Which account to log out. Leave empty to log out the active account.
@@ -352,10 +581,29 @@ def logout(alias: str = "") -> str:
     with _tool_log("logout", alias=alias or "(active)"):
         try:
             target = alias.strip() or _active_alias()
-            delete_token(target)
-            delete_web_session(target)
-            _invalidate_voyager(target)
-            deregister_alias(target)
+            validate_alias(target)  # before any per-alias state is created for it
+            with _alias_lock(target):
+                _bump_generation(target)  # any in-flight login/validation must not save
+                _invalidate_voyager(target)  # release Chromium's lock on the profile first
+                _remove_browser_profile(target)
+                try:
+                    # strict: keychain failures raise instead of being swallowed, so
+                    # the alias is only deregistered once both entries are gone.
+                    delete_token(target, strict=True)
+                    delete_web_session(target, strict=True)
+                except RuntimeError as exc:
+                    _log.warning("logout: %s", exc)
+                    return (
+                        f"❌ '{target}' NOT logged out: {exc}. The alias stays registered; "
+                        f"fix the keychain (or delete the `linkedin-mcp` entries for "
+                        f"'{target}' manually) and run `logout` again."
+                    )
+                deregister_alias(target)  # inside the lock: no authenticate can cross this boundary
+                # Retire the clear tombstone: the profile and session are gone, so there
+                # is nothing left to block recovery of. The generation counter and the
+                # alias lock are kept on purpose: an in-flight authenticate compares
+                # against the counter, and dropping it back to 0 could hide this logout.
+                _cleared_pending.discard(target)
             _log.info("Logged out '%s'", target)
             return f"✅ '{target}' logged out and removed."
         except Exception as exc:
@@ -468,7 +716,7 @@ def get_profile() -> str:
             vanity = ""
             source = "oauth"
 
-            voyager = _get_voyager_client()
+            voyager = _get_voyager_client(optional=True)
             if voyager:
                 try:
                     vme = voyager.get_me()
@@ -535,7 +783,7 @@ def update_headline(
         return f"❌ Headline is {len(headline)} characters. LinkedIn allows a maximum of 220."
 
     with _tool_log("update_headline", chars=len(headline)):
-        voyager = _get_voyager_client()
+        voyager = _get_voyager_client(optional=True)
         if voyager:
             try:
                 vme = voyager.get_me()
@@ -596,18 +844,44 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
         try:
             active = _active_alias()
             bdir = _browser_dir(active)
-            udd = bdir if has_browser_profile(bdir) else None
-            _invalidate_voyager(active)  # the validation client opens the same profile
-            _log.debug("set_web_session: validating session for '%s' (browser_dir=%s)", active, udd)
-            vc = VoyagerClient(li_at, jsessionid, user_data_dir=udd)
+            with _alias_lock(active):
+                # Release the profile (the validation client opens it) and snapshot the
+                # generation under one lock, so an overlapping clear/logout is observed.
+                _invalidate_voyager_unlocked(active)
+                generation = _session_generation.get(active, 0)
+            # The Voyager client only runs on a persistent profile (that is where the
+            # fingerprint/cookie pairing lives), so after clear_web_session removed the
+            # only profile a fresh one is created here and seeded with the supplied
+            # cookies by VoyagerClient itself (it injects them when the profile holds
+            # no session of its own). If validation fails, a profile that did not
+            # exist before is removed again so nothing half-initialised is left behind.
+            seeded = not has_browser_profile(bdir)
+            if seeded:
+                ensure_private_dir(bdir)
+            _log.debug("set_web_session: validating session for '%s' (browser_dir=%s, new=%s)", active, bdir, seeded)
+            vc = VoyagerClient(li_at, jsessionid, user_data_dir=bdir)
             try:
                 me = vc.get_me()
-            finally:
+            except Exception:
                 vc.close()
+                if seeded:
+                    with _alias_lock(active):
+                        _remove_browser_profile(active)
+                raise
+            vc.close()
             name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
             headline = me.get("headline", "")
-            save_web_session(li_at, jsessionid, active)
-            _invalidate_voyager(active)
+            with _alias_lock(active):
+                # Save, failure cleanup and singleton invalidation in one lock scope, so a
+                # concurrent Voyager request cannot create a client that is then closed
+                # underneath it between the save and the invalidation.
+                if not _save_session_if_current(li_at, jsessionid, active, generation):
+                    _remove_browser_profile(active)  # validation may have re-created it
+                    return (
+                        f"❌ Not saved: the web session for '{active}' was cleared while it was "
+                        "being validated. Run `set_web_session` again if you still want it."
+                    )
+                _invalidate_voyager_unlocked(active)
             _log.info("Web session saved for '%s' (verified as %s)", active, name)
             return (
                 f"✅ Web session saved for '{active}'\n"
@@ -618,9 +892,10 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
         except Exception as exc:
             _log.error("set_web_session failed: %s", exc)
             return (
-                f"❌ Session validation failed — browser profile may not have a valid LinkedIn session.\n"
+                f"❌ Session validation failed — LinkedIn did not accept the supplied cookies.\n"
                 f"   {_format_error(exc)}\n\n"
-                "Run `authenticate` first to set up the browser profile, then try again."
+                "Copy fresh li_at / JSESSIONID values from a logged-in browser and try again, "
+                "or run `authenticate` to log in inside the Playwright window instead."
             )
 
 
@@ -644,15 +919,17 @@ def refresh_web_session() -> str:
                     f"❌ No browser profile for '{active}'. Run `authenticate` first "
                     "(the Playwright login window creates it)."
                 )
-            _invalidate_voyager(active)  # Chromium locks the profile; free it first
-            li_at, jsessionid, err = _run_in_thread(harvest_session_from_profile, bdir)
-            if not li_at:
-                return (
-                    f"❌ Could not recover a session from the browser profile ({err}).\n"
-                    "   Run `authenticate` again and log in inside the window that opens, "
-                    "or use `set_web_session`."
-                )
-            save_web_session(li_at, jsessionid or "", active)
+            with _alias_lock(active):  # never interleave with clear_web_session / logout
+                _invalidate_voyager(active)  # Chromium locks the profile; free it first
+                li_at, jsessionid, err = _run_in_thread(harvest_session_from_profile, bdir)
+                if not li_at:
+                    return (
+                        f"❌ Could not recover a session from the browser profile ({err}).\n"
+                        "   Run `authenticate` again and log in inside the window that opens, "
+                        "or use `set_web_session`."
+                    )
+                save_web_session(li_at, jsessionid or "", active)
+                _session_persisted(active)
             _log.info("Web session refreshed for '%s' from browser profile", active)
             return (
                 f"✅ Web session refreshed for '{active}' from the browser profile.\n"
@@ -666,19 +943,48 @@ def refresh_web_session() -> str:
 @mcp.tool()
 def clear_web_session() -> str:
     """
-    Remove the stored LinkedIn browser session cookies.
+    Remove the stored LinkedIn browser session cookies AND the persistent
+    browser profile for the active account, switching the Voyager tier off.
 
-    After clearing, get_profile and update_headline fall back to the OAuth API
-    (which cannot read/write the headline without partner-level scopes).
+    Both must go: the profile is a logged-in browser, and the server would
+    otherwise re-harvest the session from it on the next call. After clearing,
+    get_profile and update_headline fall back to the OAuth API (which cannot
+    read/write the headline without partner-level scopes) until a session is
+    deliberately stored again: `authenticate`, `set_web_session`, or
+    `refresh_web_session` against a profile that is logged in again.
     """
     with _tool_log("clear_web_session"):
         try:
             active = _active_alias()
-            existed = delete_web_session(active)
-            _invalidate_voyager(active)
-            if existed:
+            with _alias_lock(active):
+                _bump_generation(active)  # any in-flight login/validation must not save
+                _invalidate_voyager(active)  # release Chromium's lock on the profile first
+                # Profile first: if its removal fails, the stored session is left in
+                # place so a logged-in profile is never left behind for recovery.
+                profile_removed = _remove_browser_profile(active)
+                try:
+                    # strict: a keychain failure raises instead of being swallowed, so
+                    # success is never reported while a live li_at survives there.
+                    existed = delete_web_session(active, strict=True)
+                except RuntimeError as exc:
+                    _log.warning("clear_web_session: %s", exc)
+                    return (
+                        f"❌ Browser profile {'removed' if profile_removed else 'was not present'}, "
+                        f"but the stored web session for '{active}' could not be removed from "
+                        f"the OS keychain ({exc}). Delete the `linkedin-mcp / session:{active}` "
+                        f"entry manually and re-run."
+                    )
+            if existed or profile_removed:
                 _log.info("Web session cleared for '%s'", active)
-                return f"✅ Web session cleared for '{active}'."
+                removed = " and ".join(
+                    part for part, done in (("stored cookies removed", existed),
+                                            ("browser profile removed", profile_removed)) if done
+                )
+                return (
+                    f"✅ Web session cleared for '{active}' ({removed}). "
+                    "Voyager stays off until a session is deliberately stored again "
+                    "(`authenticate`, `set_web_session`, or `refresh_web_session`)."
+                )
             return f"ℹ️ No web session found for '{active}' — nothing to clear."
         except Exception as exc:
             return _format_error(exc)

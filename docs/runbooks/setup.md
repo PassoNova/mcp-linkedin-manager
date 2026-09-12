@@ -72,16 +72,17 @@ When prompted:
 The credentials are written directly to:
 - **macOS**: Keychain Access (`linkedin-mcp / credentials`)
 - **Windows**: Windows Credential Manager
-- **Linux**: Secret Service (libsecret) or `~/.linkedin_mcp_credentials.json` as fallback
+- **Linux**: Secret Service (libsecret). There is **no file fallback** for app credentials — without a keychain backend the wizard exits and you must use environment variables or the `.env` file below.
 
 No `.env` file is created. You do not need to set any environment variables.
 
 **Alternative (`.env` fallback):** if the OS keychain is unavailable:
 ```bash
-cp .env.example .env
+cp ../.env.example .env   # .env.example is at the repository root
+chmod 600 .env
 # Edit .env with LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET
 ```
-On the first `authenticate` call, the `.env` values are auto-migrated to the keychain.
+With a keychain backend, the first `authenticate` migrates the `.env` values to the keychain (`check_auth` reports `credentials_in_keychain: true`) and the file can then be deleted. Without one, nothing is migrated and the `.env` must stay.
 
 ---
 

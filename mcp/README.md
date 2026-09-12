@@ -19,10 +19,10 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cla
 | Tool | What it does |
 |---|---|
 | `authenticate` | OAuth 2.0 browser flow — saves token; also captures browser session cookies for Voyager |
-| `logout` | Delete the saved OAuth token |
+| `logout` | Remove an account's OAuth token, web session **and** browser profile, and unregister the alias |
 | `check_auth` | Token status, granted scopes, and active capability **tier** |
 | `set_web_session` | Manually store `li_at` + `JSESSIONID` cookies (if not captured automatically) |
-| `clear_web_session` | Remove saved browser session cookies |
+| `clear_web_session` | Delete the stored session cookies **and** the logged-in browser profile — switches Voyager off until a session is deliberately stored again (`authenticate`, `set_web_session`, or `refresh_web_session` against a still-logged-in profile) |
 
 ### Profile
 | Tool | What it does |
@@ -70,23 +70,21 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cla
    ```
 5. Copy **Client ID** and **Client Secret**
 
-### 2. Save credentials
+### 2. Save credentials to the OS keychain
 
 ```bash
-cat > ~/.linkedin_mcp.env << 'EOF'
-LINKEDIN_CLIENT_ID=PASTE_CLIENT_ID_HERE
-LINKEDIN_CLIENT_SECRET=PASTE_CLIENT_SECRET_HERE
-EOF
-chmod 600 ~/.linkedin_mcp.env
+cd /full/path/to/linkedin-mcp/mcp
+uv run python -m linkedin_mcp setup
 ```
+
+The wizard prompts for the Client ID and Client Secret (no echo) and stores them in the OS keychain. Do **not** pass them to `claude mcp add --env` / `-e` or put them in `settings.json` — Claude's config is a plaintext file. If your system has no keychain, export `LINKEDIN_CLIENT_ID` / `LINKEDIN_CLIENT_SECRET` in the environment that launches Claude, or keep them in a `chmod 600` `.env` next to `server.py`, which the server loads itself.
 
 ### 3. Connect to Claude Code
 
-The server uses [uv](https://docs.astral.sh/uv/) for dependency management — no separate `pip install` needed.
+The server uses [uv](https://docs.astral.sh/uv/) for dependency management — no separate `pip install` needed. Register it without any credentials:
 
 ```bash
 claude mcp add linkedin-manager \
-  --env-file ~/.linkedin_mcp.env \
   -- uv run --directory /full/path/to/linkedin-mcp/mcp python server.py
 ```
 
@@ -97,11 +95,7 @@ Or add directly to `~/.claude/settings.json`:
   "mcpServers": {
     "linkedin-manager": {
       "command": "uv",
-      "args": ["run", "--directory", "/full/path/to/linkedin-mcp/mcp", "python", "server.py"],
-      "env": {
-        "LINKEDIN_CLIENT_ID": "your_client_id",
-        "LINKEDIN_CLIENT_SECRET": "your_client_secret"
-      }
+      "args": ["run", "--directory", "/full/path/to/linkedin-mcp/mcp", "python", "server.py"]
     }
   }
 }
@@ -157,7 +151,7 @@ mcp/
 
 | Symptom | Fix |
 |---|---|
-| `credentials are not configured` | Check `~/.linkedin_mcp.env` and restart Claude |
+| `credentials are not configured` | Run `uv run python -m linkedin_mcp setup` (keychain), or set `LINKEDIN_CLIENT_ID` / `LINKEDIN_CLIENT_SECRET` in the server's environment, then restart Claude |
 | `401 Unauthorized` | Token expired — run `authenticate` again |
 | `403 Forbidden` on `update_headline` | Voyager session needed — run `authenticate` |
 | `403 Forbidden` on profile sections | Use `get_full_profile` (Voyager) instead |

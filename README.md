@@ -11,13 +11,13 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cla
 | Tool | What it does |
 |---|---|
 | `authenticate` | OAuth 2.0 browser flow for a named alias (e.g. `work`, `personal`) |
-| `logout` | Remove one user's credentials (defaults to active account) |
+| `logout` | Remove an account's OAuth token, web session **and** browser profile, and unregister the alias |
 | `check_auth` | Show active user's token status, capability tier, scopes, and keychain status |
 | `switch_user` | Set the active LinkedIn account by alias |
 | `list_users` | List all registered aliases with their auth status and tier |
 | `refresh_web_session` | Re-read the LinkedIn session from the persistent browser profile (no browser interaction) |
 | `set_web_session` | Manually store `li_at` + `JSESSIONID` cookies for the active account |
-| `clear_web_session` | Remove browser session cookies for the active account |
+| `clear_web_session` | Delete the stored session cookies **and** the logged-in browser profile — switches Voyager off until a session is deliberately stored again (`authenticate`, `set_web_session`, or `refresh_web_session` against a still-logged-in profile) |
 | `clear_credentials` | Remove shared app credentials (Client ID + Secret) from the OS keychain |
 
 ### Profile & content tools
@@ -65,6 +65,8 @@ Each alias has its own tier:
 | `BASE` | No valid token | `authenticate` only |
 | `OAUTH` | Valid OAuth token | All standard tools |
 | `VOYAGER` | OAuth token + browser session | All tools, including full profile, notifications, and conversations |
+
+> **Voyager is LinkedIn's unofficial, internal web API — not a supported developer surface.** Using it with your own session cookies is automated access that LinkedIn's [User Agreement](https://www.linkedin.com/legal/user-agreement) does not permit, and it can lead to warnings, temporary restrictions, or suspension of your LinkedIn account. It is **off by default**: nothing touches Voyager unless a web session (`li_at`) exists for the active alias, and every Voyager-backed tool degrades to the official API (or reports the missing session) when it does not. Use it knowingly, at your own risk, and only on your own account. See [SECURITY.md](https://github.com/PassoNova/mcp-linkedin-manager/blob/main/SECURITY.md).
 
 The Voyager tier uses the same internal API as LinkedIn's web app (`li_at` + `JSESSIONID` cookies). `authenticate` opens the LinkedIn login in a Playwright window on a per-account browser profile and reads the session from that profile once you approve the app, so no cookie copying is needed. If Playwright's Chromium cannot reach the network, the flow falls back to your system browser and Chrome's cookie store. `refresh_web_session` re-reads the profile at any time; `set_web_session` remains as a manual last resort. Set `LINKEDIN_AUTH_MODE=playwright|browser` to force one path.
 
@@ -114,11 +116,12 @@ This prompts for your Client ID and Client Secret interactively (secret input, n
 
 ```bash
 cd linkedin-mcp/mcp
-cp .env.example .env
+cp ../.env.example .env   # .env.example lives at the repository root; the server reads .env next to server.py
+chmod 600 .env
 # Edit .env and fill in LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET
 ```
 
-On first `authenticate`, credentials are auto-migrated from the `.env` file to the keychain and you can delete the file afterward.
+When a keychain backend is available, the first `authenticate` migrates the credentials from `.env` to the keychain (check with `check_auth` → `credentials_in_keychain: true`) and you can delete the file. Without a keychain backend nothing is migrated — the `.env` stays the source of the credentials, so keep it.
 
 ### 3. Install dependencies
 
@@ -167,7 +170,7 @@ Add this block to `~/.claude/settings.json` (or the equivalent config file for y
 }
 ```
 
-> **Note:** If the OS keychain is unavailable on your system, add `"env": {"LINKEDIN_CLIENT_ID": "...", "LINKEDIN_CLIENT_SECRET": "..."}` to the block above as a fallback.
+> **Note:** Do not put `LINKEDIN_CLIENT_SECRET` in this block (or pass it via `claude mcp add --env`): Claude's config is a plaintext file. The server reads app credentials from the OS keychain (`python -m linkedin_mcp setup`). If no keychain is available on your system, export `LINKEDIN_CLIENT_ID` / `LINKEDIN_CLIENT_SECRET` in the environment that launches Claude, or keep them in a `0600` `.env` next to `server.py` that the server loads itself.
 
 ---
 
@@ -307,8 +310,11 @@ All three credential classes are stored in the OS keychain when `keyring` is ava
 
 The user registry (`~/.linkedin_mcp_users.json`) stores only alias names and the active pointer — it is not sensitive.
 
-- App credentials have **no plaintext file fallback** — if the keychain is unavailable they must come from environment variables.
-- Fallback files are written with mode `0600` (owner-read only).
+- The server never writes app credentials to a file. If the keychain is unavailable, they must come from environment variables or from a `0600` `.env` next to `server.py` that you create yourself (Option B above).
+- Fallback files are created with mode `0600` (owner-read only) from the moment they exist; the per-alias Playwright profile directory (`~/.linkedin_mcp_browser_<alias>/`, which holds the live session cookie) and the log file (`~/.linkedin_mcp.log`) are kept owner-only (`0700` / `0600`).
+- The installers (`scripts/install.sh`, `setup.sh`) never pass the client secret to `claude mcp add`; that would persist it in plaintext in Claude's config. Store it with `python -m linkedin_mcp setup` instead.
+- `scripts/install.sh` verifies the release archive against the published `linkedin-mcp.plugin.sha256` and refuses to wipe `$HOME`, `/`, or a non-empty directory that is not a previous install.
+- See [SECURITY.md](https://github.com/PassoNova/mcp-linkedin-manager/blob/main/SECURITY.md) for the threat model, the Voyager disclosure, and how to report a vulnerability.
 - Never commit your `.env` file to version control. Delete it once credentials are in the keychain.
 - LinkedIn OAuth tokens expire after **60 days**. Re-run `authenticate` when prompted.
 - Browser session cookies (`li_at`, `JSESSIONID`) typically last ~1 year but are invalidated if you log out of linkedin.com.

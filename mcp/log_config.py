@@ -28,6 +28,64 @@ _FORMATTER = logging.Formatter(
 )
 
 
+class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler whose log files are always created with mode 0600.
+
+    The stock handler opens the base file with the process umask, on creation
+    and again after every rollover. The log can carry aliases, profile paths
+    and API error bodies, so every file it creates is opened via ``os.open``
+    with an explicit ``0o600`` and tightened on the descriptor if it already
+    existed with looser permissions.
+    """
+
+    def __init__(self, filename: str, **kwargs) -> None:
+        super().__init__(filename, **kwargs)
+        self._tighten_backups()
+
+    def _open(self):  # type: ignore[override]
+        if os.path.islink(self.baseFilename):
+            raise OSError(f"refusing to log to {self.baseFilename}: it is a symlink")
+        # O_NOFOLLOW makes the symlink refusal atomic where the platform has it.
+        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        if self.mode.startswith("w"):
+            flags |= os.O_TRUNC
+        fd = os.open(self.baseFilename, flags, 0o600)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+        except OSError as exc:
+            # Fail closed: never keep writing to a log we could not make owner-only
+            # (e.g. a file owned by another user). Point LINKEDIN_MCP_LOG elsewhere.
+            os.close(fd)
+            raise OSError(
+                f"refusing to log to {self.baseFilename}: cannot make it owner-only ({exc}); "
+                "fix its ownership/permissions or set LINKEDIN_MCP_LOG to another path"
+            ) from exc
+        return open(fd, self.mode, encoding=self.encoding, errors=self.errors)
+
+    def _tighten_backups(self) -> None:
+        """Re-apply 0600 to rotated backups (``<log>.1`` … ``<log>.N``).
+
+        Backups written by an older version, or by a stock handler, keep the
+        mode they were created with; rollover only renames them. Run at
+        setup and after every rollover.
+        """
+        for i in range(1, self.backupCount + 1):
+            backup = self.rotation_filename(f"{self.baseFilename}.{i}")
+            if os.path.islink(backup):
+                raise OSError(f"refusing to touch log backup {backup}: it is a symlink")
+            if os.path.exists(backup):
+                os.chmod(backup, 0o600)
+
+    def doRollover(self) -> None:  # noqa: N802 - logging API
+        # Tighten first: if an existing backup cannot be made owner-only, fail
+        # before any loose file is renamed into the rotation. Then again after,
+        # for the file the rollover just created.
+        self._tighten_backups()
+        super().doRollover()
+        self._tighten_backups()
+
+
 def setup() -> None:
     """Configure root logger with a rotating file handler and optional stderr output."""
     root = logging.getLogger("linkedin_mcp")
@@ -38,7 +96,7 @@ def setup() -> None:
 
     # Rotating file handler — always on
     os.makedirs(os.path.dirname(os.path.abspath(LOG_FILE)), exist_ok=True)
-    fh = logging.handlers.RotatingFileHandler(
+    fh = _PrivateRotatingFileHandler(
         LOG_FILE,
         maxBytes=5 * 1024 * 1024,  # 5 MB
         backupCount=3,

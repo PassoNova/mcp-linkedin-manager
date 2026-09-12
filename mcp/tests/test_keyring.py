@@ -450,3 +450,87 @@ class TestDeleteCredentials:
 
         result = auth.delete_credentials()
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# delete_web_session(strict=True)
+# ---------------------------------------------------------------------------
+
+class TestDeleteWebSessionStrict:
+    def _kr(self, monkeypatch, tmp_path, *, delete_error, read):
+        import auth
+        monkeypatch.setattr(auth, "_HAS_KEYRING", True)
+        mock_kr = MagicMock()
+        mock_kr.delete_password.side_effect = delete_error
+        if isinstance(read, Exception):
+            mock_kr.get_password.side_effect = read
+        else:
+            mock_kr.get_password.return_value = read
+        monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"no_{alias}.json"))
+        return auth
+
+    def test_delete_error_with_surviving_entry_raises(self, tmp_path, monkeypatch):
+        import pytest
+        auth = self._kr(monkeypatch, tmp_path, delete_error=RuntimeError("locked"), read='{"li_at": "L"}')
+        with pytest.raises(RuntimeError, match="refused to delete"):
+            auth.delete_web_session("work", strict=True)
+
+    def test_delete_error_with_unreadable_keychain_raises(self, tmp_path, monkeypatch):
+        import pytest
+        auth = self._kr(monkeypatch, tmp_path, delete_error=RuntimeError("locked"), read=RuntimeError("no backend"))
+        with pytest.raises(RuntimeError, match="unavailable"):
+            auth.delete_web_session("work", strict=True)
+
+    def test_delete_error_for_absent_entry_is_not_an_error(self, tmp_path, monkeypatch):
+        auth = self._kr(monkeypatch, tmp_path, delete_error=RuntimeError("no such entry"), read=None)
+        assert auth.delete_web_session("work", strict=True) is False
+
+    def test_non_strict_still_swallows(self, tmp_path, monkeypatch):
+        auth = self._kr(monkeypatch, tmp_path, delete_error=RuntimeError("locked"), read='{"li_at": "L"}')
+        assert auth.delete_web_session("work") is False
+
+    def test_strict_removes_fallback_file_before_raising(self, tmp_path, monkeypatch):
+        import pytest
+        auth = self._kr(monkeypatch, tmp_path, delete_error=RuntimeError("locked"), read='{"li_at": "L"}')
+        path = tmp_path / "no_work.json"
+        path.write_text("{}")
+        with pytest.raises(RuntimeError):
+            auth.delete_web_session("work", strict=True)
+        assert not path.exists()
+
+
+class TestDeleteTokenStrict:
+    def test_strict_raises_when_entry_survives(self, tmp_path, monkeypatch):
+        import auth, pytest
+        monkeypatch.setattr(auth, "_HAS_KEYRING", True)
+        mock_kr = MagicMock()
+        mock_kr.delete_password.side_effect = RuntimeError("locked")
+        mock_kr.get_password.return_value = '{"access_token": "x"}'
+        monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / "tok.json"))
+        (tmp_path / "tok.json").write_text("{}")
+        with pytest.raises(RuntimeError, match="OAuth token"):
+            auth.delete_token("work", strict=True)
+        assert not (tmp_path / "tok.json").exists()  # file copy removed first
+
+    def test_non_strict_unchanged(self, tmp_path, monkeypatch):
+        import auth
+        monkeypatch.setattr(auth, "_HAS_KEYRING", True)
+        mock_kr = MagicMock()
+        mock_kr.delete_password.side_effect = RuntimeError("locked")
+        monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / "none.json"))
+        assert auth.delete_token("work") is False
+
+    def test_symlinked_fallback_file_is_refused(self, tmp_path, monkeypatch):
+        import auth, pytest
+        monkeypatch.setattr(auth, "_HAS_KEYRING", False)
+        real = tmp_path / "real.json"
+        real.write_text("{}")
+        link = tmp_path / "tok.json"
+        link.symlink_to(real)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(link))
+        with pytest.raises(OSError, match="symlink"):
+            auth.delete_token("work", strict=True)
+        assert real.exists() and link.is_symlink()

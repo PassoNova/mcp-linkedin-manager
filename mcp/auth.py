@@ -112,6 +112,75 @@ def _browser_dir(alias: str) -> str:
     return os.path.expanduser(f"~/.linkedin_mcp_browser_{alias}")
 
 
+def ensure_private_dir(path: str) -> None:
+    """Create ``path`` (if needed) and force owner-only permissions (0700).
+
+    The Playwright profile holds the live LinkedIn session cookie, so it must
+    never be group- or world-readable. ``os.makedirs(mode=...)`` is masked by
+    the umask, and pre-existing directories are left untouched by it, so an
+    explicit ``chmod`` follows in both cases.
+
+    POSIX only: on Windows ``os.chmod`` cannot express an owner-only ACL, so
+    there the guarantee is only what the per-user profile location provides.
+
+    A symlink at ``path`` is refused (``makedirs``/``chmod``/Chromium would all
+    follow it and put the live cookie somewhere else).
+    """
+    if os.path.islink(path):
+        raise OSError(f"refusing to use {path} as a browser profile: it is a symlink")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def _tighten_private_file(path: str) -> None:
+    """Re-apply 0600 to an existing fallback file.
+
+    Files written by older versions may still be 0644; reading them is the
+    common path (writes only happen at login), so tighten on every load —
+    including loads served from the keychain, so a stale file copy is fixed
+    too. Fails closed: if the mode cannot be applied the caller must not use
+    the file (``OSError`` is raised, mirroring the log handler).
+    """
+    if not os.path.lexists(path):
+        return
+    if os.path.islink(path):
+        raise OSError(f"refusing to use {path}: it is a symlink")
+    try:
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        raise OSError(
+            f"refusing to use {path}: cannot make it owner-only ({exc}); "
+            "fix its ownership/permissions or delete it"
+        ) from exc
+
+
+def _write_private_json(path: str, data: dict) -> None:
+    """Write ``data`` as JSON to ``path`` with mode 0600 from the moment it exists.
+
+    Opening with ``os.open(..., 0o600)`` avoids the window where a file created
+    by ``open(path, "w")`` is readable under the default umask before a later
+    ``chmod``. The mode argument only applies to a *new* file, so an existing
+    (possibly looser) file is tightened on its descriptor before anything is
+    written to it.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if os.path.islink(path):
+        raise OSError(f"refusing to write {path}: it is a symlink")
+    # O_NOFOLLOW makes the symlink refusal atomic where the platform has it.
+    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:  # pragma: no cover - Windows < 3.13
+            os.chmod(path, 0o600)
+    except OSError:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh, indent=2)
+
+
 # ── OAuth callback pages ───────────────────────────────────────────────────────
 
 _SUCCESS_PAGE = """<!DOCTYPE html>
@@ -326,11 +395,10 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         received_state = params.get("state", [None])[0]
 
         if "code" in params:
-            if srv.expected_state and received_state != srv.expected_state:
-                srv.error = (
-                    f"State mismatch in OAuth callback — possible CSRF attempt. "
-                    f"Expected {srv.expected_state!r}, got {received_state!r}."
-                )
+            if srv.expected_state and not secrets.compare_digest(
+                (received_state or "").encode(), srv.expected_state.encode()
+            ):
+                srv.error = "State mismatch in OAuth callback — possible CSRF attempt."
                 body = _ERROR_PAGE.encode()
                 self.send_response(400)
             else:
@@ -419,8 +487,15 @@ def exchange_code(
 
 
 def has_browser_profile(path: str = DEFAULT_BROWSER_DIR) -> bool:
-    """Return True if a persistent Playwright browser profile has been created."""
-    return os.path.exists(path) and bool(os.listdir(path))
+    """Return True if a persistent Playwright browser profile has been created.
+
+    This is the first thing every profile-opening path checks, so an existing
+    directory is tightened to 0700 here — before it is listed or launched.
+    """
+    if not os.path.isdir(path):
+        return False
+    ensure_private_dir(path)
+    return bool(os.listdir(path))
 
 
 def _capture_chrome_linkedin_cookies() -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -618,6 +693,7 @@ def harvest_session_from_profile(
     if not has_browser_profile(browser_dir):
         return None, None, "no browser profile — run `authenticate` first"
     try:
+        ensure_private_dir(browser_dir)
         with _sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 browser_dir, headless=True, args=_LAUNCH_ARGS
@@ -651,7 +727,7 @@ def _init_headless_profile(
     """
     try:
         _log.debug("Initializing Playwright headless profile at %s", browser_dir)
-        os.makedirs(browser_dir, exist_ok=True)
+        ensure_private_dir(browser_dir)
         with _sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 browser_dir, headless=True, args=_LAUNCH_ARGS
@@ -751,7 +827,7 @@ def _run_oauth_flow_playwright(
     redirect_uri = f"http://localhost:{port}/callback"
     state = secrets.token_urlsafe(16)
     auth_url = build_auth_url(client_id, redirect_uri, state)
-    os.makedirs(browser_dir, exist_ok=True)
+    ensure_private_dir(browser_dir)
 
     callback = _CallbackServer(port, state)
     callback.start()
@@ -961,6 +1037,8 @@ async def run_oauth_flow(
 def save_token(token_data: dict, alias: str) -> None:
     """Persist token_data to OS keychain under alias, falling back to a per-alias file."""
     key = f"{_KR_KEY_TOKEN}:{alias}"
+    path = _token_path(alias)
+    _tighten_private_file(path)  # a stale file copy is fixed even when the keychain wins
     if _HAS_KEYRING:
         try:
             keyring.set_password(_KR_SERVICE, key, json.dumps(token_data))
@@ -968,17 +1046,15 @@ def save_token(token_data: dict, alias: str) -> None:
             return
         except Exception as exc:
             _log.debug("Keychain save failed, using file: %s", exc)
-    path = _token_path(alias)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w") as fh:
-        json.dump(token_data, fh, indent=2)
-    os.chmod(path, 0o600)
+    _write_private_json(path, token_data)
     _log.debug("Token for '%s' saved to %s", alias, path)
 
 
 def load_token(alias: str) -> Optional[dict]:
     """Load saved token for alias, checking OS keychain first then file."""
     key = f"{_KR_KEY_TOKEN}:{alias}"
+    path = _token_path(alias)
+    _tighten_private_file(path)  # even on a keychain hit a stale file copy gets fixed
     if _HAS_KEYRING:
         try:
             raw = keyring.get_password(_KR_SERVICE, key)
@@ -986,7 +1062,6 @@ def load_token(alias: str) -> Optional[dict]:
                 return json.loads(raw)
         except Exception:
             pass
-    path = _token_path(alias)
     if not os.path.exists(path):
         return None
     with open(path) as fh:
@@ -1005,22 +1080,52 @@ def is_token_expired(token_data: dict, buffer_seconds: int = 300) -> bool:
     return time.time() >= (obtained_at + expires_in - buffer_seconds)
 
 
-def delete_token(alias: str) -> bool:
-    """Remove saved token for alias from keychain and/or file. Returns True if anything deleted."""
-    key = f"{_KR_KEY_TOKEN}:{alias}"
+def _delete_secret(kind: str, key: str, path: str, alias: str, strict: bool) -> bool:
+    """Shared body of delete_token / delete_web_session.
+
+    Removes the fallback file first, then the keychain entry. With ``strict``
+    a keychain failure raises ``RuntimeError`` unless a read confirms the
+    entry is absent, so callers can only report success when nothing is left.
+    """
     deleted = False
+    if os.path.islink(path):
+        # Removing the link would leave the secret at its target while we
+        # report success; refuse, consistent with the read/write paths.
+        raise OSError(f"refusing to delete {path}: it is a symlink")
+    if os.path.exists(path):
+        os.remove(path)
+        deleted = True
     if _HAS_KEYRING:
         try:
             keyring.delete_password(_KR_SERVICE, key)
             deleted = True
-        except Exception:
-            pass
-    path = _token_path(alias)
-    if os.path.exists(path):
-        os.remove(path)
-        deleted = True
-    _log.debug("Token for '%s' deleted: %s", alias, deleted)
+        except Exception as exc:
+            if strict:
+                # keyring raises for a missing entry too — accept only if a
+                # read confirms it is really gone.
+                try:
+                    still_there = keyring.get_password(_KR_SERVICE, key) is not None
+                except Exception as read_exc:
+                    raise RuntimeError(
+                        f"keychain unavailable while clearing the {kind} for '{alias}': {read_exc}"
+                    ) from read_exc
+                if still_there:
+                    raise RuntimeError(
+                        f"keychain refused to delete the {kind} for '{alias}': {exc}"
+                    ) from exc
+            else:
+                _log.debug("Keychain delete of %s for '%s' failed: %s", kind, alias, exc)
+    _log.debug("%s for '%s' deleted: %s", kind.capitalize(), alias, deleted)
     return deleted
+
+
+def delete_token(alias: str, *, strict: bool = False) -> bool:
+    """Remove saved token for alias from keychain and/or file. Returns True if anything deleted.
+
+    ``strict=True`` raises ``RuntimeError`` on an unverifiable keychain failure
+    (see ``_delete_secret``); ``logout`` relies on it.
+    """
+    return _delete_secret("OAuth token", f"{_KR_KEY_TOKEN}:{alias}", _token_path(alias), alias, strict)
 
 
 # ── Web session persistence (Voyager cookies, per-user) ───────────────────────
@@ -1029,6 +1134,8 @@ def save_web_session(li_at: str, jsessionid: str, alias: str) -> None:
     """Persist li_at and JSESSIONID cookies for alias, preferring OS keychain."""
     key = f"{_KR_KEY}:{alias}"
     data = {"li_at": li_at, "jsessionid": jsessionid, "_saved_at": int(time.time())}
+    path = _session_path(alias)
+    _tighten_private_file(path)  # a stale file copy is fixed even when the keychain wins
     if _HAS_KEYRING:
         try:
             keyring.set_password(_KR_SERVICE, key, json.dumps(data))
@@ -1036,17 +1143,15 @@ def save_web_session(li_at: str, jsessionid: str, alias: str) -> None:
             return
         except Exception as exc:
             _log.debug("Keychain session save failed, using file: %s", exc)
-    path = _session_path(alias)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w") as fh:
-        json.dump(data, fh, indent=2)
-    os.chmod(path, 0o600)
+    _write_private_json(path, data)
     _log.debug("Web session for '%s' saved to %s", alias, path)
 
 
 def load_web_session(alias: str) -> Optional[dict]:
     """Load saved web session cookies for alias, checking keychain first then file."""
     key = f"{_KR_KEY}:{alias}"
+    path = _session_path(alias)
+    _tighten_private_file(path)  # even on a keychain hit a stale file copy gets fixed
     if _HAS_KEYRING:
         try:
             raw = keyring.get_password(_KR_SERVICE, key)
@@ -1054,29 +1159,21 @@ def load_web_session(alias: str) -> Optional[dict]:
                 return json.loads(raw)
         except Exception:
             pass
-    path = _session_path(alias)
     if not os.path.exists(path):
         return None
     with open(path) as fh:
         return json.load(fh)
 
 
-def delete_web_session(alias: str) -> bool:
-    """Remove saved web session for alias from keychain and/or file. Returns True if deleted."""
-    key = f"{_KR_KEY}:{alias}"
-    deleted = False
-    if _HAS_KEYRING:
-        try:
-            keyring.delete_password(_KR_SERVICE, key)
-            deleted = True
-        except Exception:
-            pass
-    path = _session_path(alias)
-    if os.path.exists(path):
-        os.remove(path)
-        deleted = True
-    _log.debug("Web session for '%s' deleted: %s", alias, deleted)
-    return deleted
+def delete_web_session(alias: str, *, strict: bool = False) -> bool:
+    """Remove saved web session for alias from keychain and/or file. Returns True if deleted.
+
+    With ``strict=True`` a keychain failure is not swallowed: the entry must
+    either be deleted or confirmed absent by a read, otherwise ``RuntimeError``
+    is raised. ``clear_web_session`` uses this so it never reports success
+    while a live ``li_at`` still sits in the keychain.
+    """
+    return _delete_secret("web session", f"{_KR_KEY}:{alias}", _session_path(alias), alias, strict)
 
 
 # ── App credential persistence ─────────────────────────────────────────────────

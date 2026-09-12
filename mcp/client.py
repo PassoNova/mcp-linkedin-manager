@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover
     _sync_playwright = None  # type: ignore[assignment]
     _PLAYWRIGHT_AVAILABLE = False
 
+from auth import ensure_private_dir
 from cache import SimpleCache
 
 # ---------------------------------------------------------------------------
@@ -366,6 +367,8 @@ class VoyagerClient:
         self._context: Any = None
         self._page: Any = None
         self._lock = threading.Lock()
+        self._closed = False  # set by close(); a closed client never reopens the profile
+        self._executor_thread: Optional[threading.Thread] = None  # where Playwright objects live
         # Single dedicated thread so Playwright sync API never runs inside asyncio.
         self._executor = ThreadPoolExecutor(max_workers=1)
 
@@ -386,6 +389,13 @@ class VoyagerClient:
     def _ensure_context(self) -> None:
         """Launch the persistent Playwright context on first use; reuse on subsequent calls."""
         with self._lock:
+            # Closed check first: close() flips the flag before the teardown is
+            # queued, so a call racing it must not take the live-context fast path.
+            if self._closed:
+                raise RuntimeError(
+                    "VoyagerClient is closed (the session was cleared or replaced); "
+                    "obtain a fresh client instead of reusing this one."
+                )
             if self._context is not None:
                 return
             if not self._user_data_dir:
@@ -395,6 +405,8 @@ class VoyagerClient:
                     "needed for Voyager API access."
                 )
             _log.debug("VoyagerClient: launching Playwright context at %s", self._user_data_dir)
+            self._executor_thread = threading.current_thread()
+            ensure_private_dir(self._user_data_dir)  # profile holds the live session cookie
             self._playwright = _sync_playwright().__enter__()
             self._context = self._playwright.chromium.launch_persistent_context(
                 self._user_data_dir,
@@ -419,30 +431,84 @@ class VoyagerClient:
                 _log.debug("VoyagerClient: profile already holds a LinkedIn session; keeping it")
             else:
                 self._inject_cookies()
-            atexit.register(self.close)
+            atexit.register(self._close_quietly)
             _log.info("VoyagerClient: Playwright context ready at %s", self._user_data_dir)
 
-    def close(self) -> None:
-        """Close the persistent browser context and release Playwright."""
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("VoyagerClient is closed; the web session was cleared or replaced")
+
+    def _teardown(self) -> None:
+        """Release the Playwright objects. Must run on the thread that created them.
+
+        Every step is attempted (best effort), but a failure is re-raised at the
+        end so close() cannot report a clean shutdown while Chromium may still
+        hold the profile; callers then refuse to delete that profile.
+        """
+        errors: list[str] = []
         with self._lock:
+            # Each handle is dropped only once its close succeeded; a failed close
+            # keeps its handle so a later close() can retry instead of leaking a
+            # live Chromium behind a client that already forgot about it.
             try:
                 if self._page is not None:
                     self._page.close()
-            except Exception:
-                pass
+                self._page = None
+            except Exception as exc:
+                errors.append(f"page.close: {exc}")
             try:
                 if self._context is not None:
                     self._context.close()
-            except Exception:
-                pass
+                self._context = None
+            except Exception as exc:
+                errors.append(f"context.close: {exc}")
             try:
                 if self._playwright is not None:
                     self._playwright.__exit__(None, None, None)
-            except Exception:
-                pass
-            self._page = None
-            self._context = None
-            self._playwright = None
+                self._playwright = None
+            except Exception as exc:
+                errors.append(f"playwright.stop: {exc}")
+        if errors:
+            raise RuntimeError("VoyagerClient teardown incomplete: " + "; ".join(errors))
+
+    def _close_quietly(self) -> None:
+        """atexit hook: best-effort close that never raises during interpreter shutdown."""
+        try:
+            self.close()
+        except Exception as exc:
+            _log.warning("VoyagerClient: close at exit failed: %s", exc)
+
+    def close(self) -> None:
+        """Close the persistent browser context and release Playwright.
+
+        The client is permanently closed afterwards: a stale reference held
+        across clear_web_session / logout cannot recreate the deleted profile,
+        and cached Voyager results are dropped so they cannot outlive the
+        session. Playwright's sync objects belong to the executor thread, so
+        the teardown is scheduled there (behind any in-flight request) and
+        awaited; callers can then remove the profile knowing Chromium is gone.
+        """
+        with self._lock:
+            self._closed = True
+            self._cache = SimpleCache()
+            nothing_open = self._playwright is None and self._context is None and self._page is None
+        if nothing_open:
+            return
+        if threading.current_thread() is self._executor_thread:
+            self._teardown()
+            return
+        try:
+            future = self._executor.submit(self._teardown)
+        except RuntimeError:
+            # The executor is shut down, so no Playwright work can be running on it;
+            # tearing down inline cannot race with anything.
+            self._teardown()
+            return
+        # Never tear down from this thread while the executor may still be using the
+        # page: wait for the executor to do it. A timeout means a Voyager request is
+        # still running; surface that instead of racing it, so callers do not go on
+        # to delete a profile Chromium is still using.
+        future.result(timeout=120)
 
     def __del__(self) -> None:
         try:
@@ -507,6 +573,7 @@ class VoyagerClient:
         Returns a normalized dict with keys: headline, first_name, last_name,
         public_id, entity_urn, picture_url.
         """
+        self._check_open()
         hit, cached = self._cache.get("get_me", _CACHE_TTL_ME)
         if hit:
             return cached
@@ -614,6 +681,7 @@ class VoyagerClient:
     def get_recent_posts(self, public_id: str, count: int = 10) -> list[dict]:
         """Scrape recent posts from the member's LinkedIn activity page."""
         cache_key = f"posts:{public_id}:{count}"
+        self._check_open()
         hit, cached = self._cache.get(cache_key, _CACHE_TTL_POSTS)
         if hit:
             return cached

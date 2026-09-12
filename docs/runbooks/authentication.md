@@ -101,7 +101,7 @@ personal  OAUTH     2026-07-01
 logout("personal")
 ```
 
-Removes the OAuth token and browser session for that alias from the keychain. The alias is de-registered. App credentials are not affected.
+Removes the OAuth token and web session for that alias from the keychain **and deletes the alias's persistent browser profile** (`~/.linkedin_mcp_browser_<alias>/`, which held the logged-in LinkedIn session). The alias is de-registered. App credentials are not affected.
 
 ---
 
@@ -143,7 +143,7 @@ Then re-run `uv run python -m linkedin_mcp setup` with the new values.
 
 | Item | Keychain key | File fallback |
 |---|---|---|
-| App Client ID + Secret | `linkedin-mcp / credentials` | `~/.linkedin_mcp_credentials.json` |
+| App Client ID + Secret | `linkedin-mcp / credentials` | none — `LINKEDIN_CLIENT_ID` / `LINKEDIN_CLIENT_SECRET` env vars or a `0600` `.env` (no file is ever written by the server) |
 | Per-alias OAuth token | `linkedin-mcp / oauth_token:<alias>` | `~/.linkedin_mcp_token_<alias>.json` |
 | Per-alias browser session | `linkedin-mcp / session:<alias>` | `~/.linkedin_mcp_session_<alias>.json` |
 | Active alias pointer | `linkedin-mcp / active_user` | `~/.linkedin_mcp_active_user.json` |

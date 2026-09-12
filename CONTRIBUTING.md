@@ -34,13 +34,17 @@ For Claude Desktop / Claude Code, point `.mcp.json` at this path:
       "command": "uv",
       "args": ["run", "--directory", "/absolute/path/to/mcp", "python", "server.py"],
       "env": {
-        "LINKEDIN_CLIENT_ID": "<your-client-id>",
-        "LINKEDIN_CLIENT_SECRET": "<your-client-secret>"
+        "LINKEDIN_CLIENT_ID": "<your-client-id>"
       }
     }
   }
 }
 ```
+
+Do not put `LINKEDIN_CLIENT_SECRET` in that `env` block: `.mcp.json` and Claude's
+settings are plaintext files. Store the secret in the OS keychain with
+`python -m linkedin_mcp setup`, or, without a keychain backend, in a `chmod 600`
+`.env` next to `server.py` (see the README).
 
 ### Live log tail
 
@@ -148,7 +152,7 @@ If a tool requires VOYAGER, check `_get_voyager_client()` and return a helpful m
 1. Branch from `main`: `git checkout -b feat/my-feature`
 2. Keep commits atomic and follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `test:`, `chore:`).
 3. Ensure `uv run pytest tests/ --ignore=tests/test_playwright_pool.py` passes locally.
-4. Open a pull request targeting `main`. The CI workflow runs automatically.
+4. Open a pull request targeting `main`. The CI workflow runs automatically. `main` is branch-protected: direct pushes are rejected, and a PR needs the `test` check green before it can be merged.
 5. Squash-merge after approval. The auto-tag workflow creates a `v*` tag on merge, which triggers the release workflow that builds and publishes the `.plugin` archive to GitHub Releases.
 
 ---
@@ -173,8 +177,4 @@ This bypasses the auto-patch increment and uses whatever version you specified.
 
 ## Secrets required in the GitHub repository
 
-| Secret | Used by | Purpose |
-|---|---|---|
-| `PAT_TOKEN` | `auto-tag.yml`, `release.yml` | Push tags and create releases (GITHUB_TOKEN cannot trigger cross-workflow events) |
-
-Set these under **Settings → Secrets and variables → Actions**.
+None. Both release workflows run with the default `GITHUB_TOKEN` (`permissions: contents: write`); the auto-tag workflow builds and publishes the release in the same job chain precisely so no personal access token is needed.
