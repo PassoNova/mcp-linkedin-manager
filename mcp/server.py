@@ -390,8 +390,11 @@ async def authenticate(alias: str) -> str:
             validate_alias(alias)
             client_id, client_secret = _credentials()
             # Release the persistent profile before the login window opens on it.
-            _invalidate_voyager(alias)
-            generation = _lifecycle_generation(alias)
+            with _alias_lock(alias):
+                # Release the profile and snapshot the generation under one lock, so a
+                # clear/logout cannot slip between the two and be missed later.
+                _invalidate_voyager_unlocked(alias)
+                generation = _session_generation.get(alias, 0)
 
             result = await run_oauth_flow(
                 client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
@@ -732,10 +735,13 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
     with _tool_log("set_web_session"):
         try:
             active = _active_alias()
-            generation = _lifecycle_generation(active)
             bdir = _browser_dir(active)
+            with _alias_lock(active):
+                # Release the profile (the validation client opens it) and snapshot the
+                # generation under one lock, so an overlapping clear/logout is observed.
+                _invalidate_voyager_unlocked(active)
+                generation = _session_generation.get(active, 0)
             udd = bdir if has_browser_profile(bdir) else None
-            _invalidate_voyager(active)  # the validation client opens the same profile
             _log.debug("set_web_session: validating session for '%s' (browser_dir=%s)", active, udd)
             vc = VoyagerClient(li_at, jsessionid, user_data_dir=udd)
             try:

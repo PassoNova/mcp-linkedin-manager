@@ -75,6 +75,17 @@ fi
 
 MARKER=".linkedin-mcp-install"
 MARKER_PREFIX="linkedin-mcp.plugin installed-by scripts/install.sh"
+
+# True when the marker file holds exactly "<MARKER_PREFIX> v?X.Y.Z": the prefix is
+# compared literally (no regex interpolation) and only the version is pattern-matched.
+marker_is_ours() {
+    local line rest
+    IFS= read -r line < "$1" || return 1
+    rest="${line#"$MARKER_PREFIX "}"
+    [ "$rest" != "$line" ] || return 1
+    printf '%s\n' "$rest" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
 INSTALL_DIR="${INSTALL_DIR%/}"
 [ -n "$INSTALL_DIR" ] || INSTALL_DIR="/"
 case "/$INSTALL_DIR/" in
@@ -116,7 +127,7 @@ if [ -d "$INSTALL_DIR" ]; then
         if [ -f "$INSTALL_DIR/$MARKER" ] && [ ! -L "$INSTALL_DIR/$MARKER" ] \
            && [ -f "$INSTALL_DIR/mcp/server.py" ] && [ ! -L "$INSTALL_DIR/mcp/server.py" ] \
            && [ "$(wc -l < "$INSTALL_DIR/$MARKER")" -eq 1 ] \
-           && grep -Exq "$MARKER_PREFIX v?[0-9]+\.[0-9]+\.[0-9]+" "$INSTALL_DIR/$MARKER"; then
+           && marker_is_ours "$INSTALL_DIR/$MARKER"; then
             info "Found previous linkedin-mcp install ($(awk '{print $NF}' "$INSTALL_DIR/$MARKER")) — it will be replaced."
         elif [ -f "$INSTALL_DIR/mcp/server.py" ]; then
             err "'$INSTALL_DIR' looks like a linkedin-mcp install made before installs were marked. Refusing to delete it automatically — check its contents, then remove it yourself (rm -rf '$INSTALL_DIR') and re-run."

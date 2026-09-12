@@ -116,7 +116,7 @@ This prompts for your Client ID and Client Secret interactively (secret input, n
 
 ```bash
 cd linkedin-mcp/mcp
-cp .env.example .env
+cp ../.env.example .env   # .env.example lives at the repository root; the server reads .env next to server.py
 chmod 600 .env
 # Edit .env and fill in LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET
 ```
@@ -310,7 +310,7 @@ All three credential classes are stored in the OS keychain when `keyring` is ava
 
 The user registry (`~/.linkedin_mcp_users.json`) stores only alias names and the active pointer — it is not sensitive.
 
-- App credentials have **no plaintext file fallback** — if the keychain is unavailable they must come from environment variables.
+- The server never writes app credentials to a file. If the keychain is unavailable, they must come from environment variables or from a `0600` `.env` next to `server.py` that you create yourself (Option B above).
 - Fallback files are created with mode `0600` (owner-read only) from the moment they exist; the per-alias Playwright profile directory (`~/.linkedin_mcp_browser_<alias>/`, which holds the live session cookie) and the log file (`~/.linkedin_mcp.log`) are kept owner-only (`0700` / `0600`).
 - The installers (`scripts/install.sh`, `setup.sh`) never pass the client secret to `claude mcp add`; that would persist it in plaintext in Claude's config. Store it with `python -m linkedin_mcp setup` instead.
 - `scripts/install.sh` verifies the release archive against the published `linkedin-mcp.plugin.sha256` and refuses to wipe `$HOME`, `/`, or a non-empty directory that is not a previous install.
