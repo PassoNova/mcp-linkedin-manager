@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover
     _sync_playwright = None  # type: ignore[assignment]
     _PLAYWRIGHT_AVAILABLE = False
 
+from auth import ensure_private_dir
 from cache import SimpleCache
 
 # ---------------------------------------------------------------------------
@@ -395,6 +396,7 @@ class VoyagerClient:
                     "needed for Voyager API access."
                 )
             _log.debug("VoyagerClient: launching Playwright context at %s", self._user_data_dir)
+            ensure_private_dir(self._user_data_dir)  # profile holds the live session cookie
             self._playwright = _sync_playwright().__enter__()
             self._context = self._playwright.chromium.launch_persistent_context(
                 self._user_data_dir,

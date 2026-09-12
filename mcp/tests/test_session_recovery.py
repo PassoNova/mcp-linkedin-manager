@@ -141,3 +141,27 @@ class TestSetWebSessionFreesProfile:
         stale.close.assert_called()
         validator.close.assert_called_once()
         assert store["work"]["li_at"] == "li-new"
+
+
+class TestClearWebSessionRemovesProfile:
+    def test_profile_deleted_so_recovery_cannot_reenable_voyager(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        profile = _make_profile(tmp_path)
+        store["work"] = {"li_at": "L", "jsessionid": "J"}
+        monkeypatch.setattr(server, "delete_web_session", lambda alias: store.pop(alias, None) is not None)
+        out = server.clear_web_session()
+        assert "profile removed" in out
+        assert not profile.exists()
+        assert server._recover_session_from_profile("work") is None
+
+    def test_profile_only_still_reports_cleared(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        profile = _make_profile(tmp_path)
+        monkeypatch.setattr(server, "delete_web_session", lambda alias: False)
+        out = server.clear_web_session()
+        assert out.startswith("✅") and not profile.exists()
+
+    def test_nothing_to_clear(self, srv, monkeypatch):
+        server, _, _ = srv
+        monkeypatch.setattr(server, "delete_web_session", lambda alias: False)
+        assert server.clear_web_session().startswith("ℹ️")

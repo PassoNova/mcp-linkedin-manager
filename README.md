@@ -169,7 +169,7 @@ Add this block to `~/.claude/settings.json` (or the equivalent config file for y
 }
 ```
 
-> **Note:** If the OS keychain is unavailable on your system, add `"env": {"LINKEDIN_CLIENT_ID": "...", "LINKEDIN_CLIENT_SECRET": "..."}` to the block above as a fallback.
+> **Note:** Do not put `LINKEDIN_CLIENT_SECRET` in this block (or pass it via `claude mcp add --env`): Claude's config is a plaintext file. The server reads app credentials from the OS keychain (`python -m linkedin_mcp setup`). If no keychain is available on your system, export `LINKEDIN_CLIENT_ID` / `LINKEDIN_CLIENT_SECRET` in the environment that launches Claude, or keep them in a `0600` `.env` next to `server.py` that the server loads itself.
 
 ---
 

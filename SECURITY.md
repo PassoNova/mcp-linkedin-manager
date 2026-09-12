@@ -54,8 +54,10 @@ conversations, none of which the official Consumer API exposes.
 - Voyager is **off unless a web session exists** for the active alias. If no
   `li_at` cookie has been captured (or it has expired), no request touches
   Voyager and the tools that need it fall back to the official API or report
-  the missing session. You can remove the session at any time with
-  `clear_web_session`, and the profile directory can simply be deleted.
+  the missing session. `clear_web_session` switches it off: it deletes the
+  stored cookies **and** the per-alias browser profile (the server would
+  otherwise re-harvest the session from the still-logged-in profile on the
+  next call). Voyager stays off until you run `authenticate` again.
 - Use it only on your own account, at your own risk, and keep request volume
   low. The server does not add retries or parallelism on Voyager endpoints
   beyond what a normal browsing session would generate.

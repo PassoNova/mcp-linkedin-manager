@@ -64,23 +64,36 @@ fi
 
 # ── Validate install directory ─────────────────────────────────────────────────
 # `rm -rf "$INSTALL_DIR"` below is only ever run against a directory that is
-# new, empty, or a previous linkedin-mcp install (identified by mcp/server.py).
+# new, empty, or a previous install made by this script. Installs are marked
+# with $MARKER (written after extraction); installs that predate the marker
+# are recognised by mcp/server.py *without* a .git entry, so a source checkout
+# (this repository, or any other) is never deleted.
 
+MARKER=".linkedin-mcp-install"
 INSTALL_DIR="${INSTALL_DIR%/}"
 [ -n "$INSTALL_DIR" ] || INSTALL_DIR="/"
 RESOLVED_DIR="$(cd "$INSTALL_DIR" 2>/dev/null && pwd -P || printf '%s' "$INSTALL_DIR")"
 HOME_DIR="$(cd "$HOME" && pwd -P)"
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P || true)"
 
 case "$RESOLVED_DIR" in
     /|"$HOME_DIR")
         err "Refusing to install into '$RESOLVED_DIR' — the installer wipes the target directory. Pass a dedicated directory, e.g. ~/linkedin-mcp."
         ;;
 esac
+if [ -n "$SCRIPT_ROOT" ] && [ "$RESOLVED_DIR" = "$SCRIPT_ROOT" ]; then
+    err "Refusing to install over the directory this script lives in ('$RESOLVED_DIR')."
+fi
 if [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR" ]; then
     err "'$INSTALL_DIR' exists and is not a directory."
 fi
-if [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ] && [ ! -f "$INSTALL_DIR/mcp/server.py" ]; then
-    err "'$INSTALL_DIR' is not empty and does not look like a previous linkedin-mcp install (no mcp/server.py). Refusing to delete it — choose another directory or clear it yourself."
+if [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
+    if [ -e "$INSTALL_DIR/.git" ]; then
+        err "'$INSTALL_DIR' is a git checkout. Refusing to delete it — install into a dedicated directory instead."
+    fi
+    if [ ! -f "$INSTALL_DIR/$MARKER" ] && [ ! -f "$INSTALL_DIR/mcp/server.py" ]; then
+        err "'$INSTALL_DIR' is not empty and is not a previous linkedin-mcp install (no $MARKER). Refusing to delete it — choose another directory or clear it yourself."
+    fi
 fi
 
 # ── Resolve version ────────────────────────────────────────────────────────────
@@ -105,16 +118,26 @@ ok "Downloaded to $TMP_PLUGIN"
 # Releases publish ${ASSET}.sha256 next to the archive. Verify it when present;
 # older releases have none, in which case we warn and continue.
 
-if curl -fsSL "${DOWNLOAD_URL}.sha256" -o "$TMP_SUM" 2>/dev/null; then
-    EXPECTED="$(awk 'NR==1{print tolower($1)}' "$TMP_SUM" | tr -d '\r')"
-    [[ "$EXPECTED" =~ ^[0-9a-f]{64}$ ]] || err "Published checksum file is malformed; refusing to install."
-    ACTUAL="$(sha256_of "$TMP_PLUGIN")" || err "Neither 'sha256sum' nor 'shasum' is available; cannot verify the download."
-    [ "$ACTUAL" = "$EXPECTED" ] \
-        || err "SHA256 mismatch for ${ASSET} (${VERSION}): download is corrupt or tampered with. Aborting."
-    ok "SHA256 verified"
-else
-    warn "No ${ASSET}.sha256 published for ${VERSION}; skipping checksum verification."
-fi
+# Only a confirmed 404 (asset not published) skips verification; any other
+# failure (network, TLS, 5xx) aborts so a flaky fetch cannot downgrade the check.
+
+SUM_STATUS="$(curl -sSL -o "$TMP_SUM" -w '%{http_code}' "${DOWNLOAD_URL}.sha256" 2>/dev/null || printf '000')"
+case "$SUM_STATUS" in
+    200)
+        EXPECTED="$(awk 'NR==1{print tolower($1)}' "$TMP_SUM" | tr -d '\r')"
+        [[ "$EXPECTED" =~ ^[0-9a-f]{64}$ ]] || err "Published checksum file is malformed; refusing to install."
+        ACTUAL="$(sha256_of "$TMP_PLUGIN")" || err "Neither 'sha256sum' nor 'shasum' is available; cannot verify the download."
+        [ "$ACTUAL" = "$EXPECTED" ] \
+            || err "SHA256 mismatch for ${ASSET} (${VERSION}): download is corrupt or tampered with. Aborting."
+        ok "SHA256 verified"
+        ;;
+    404)
+        warn "No ${ASSET}.sha256 published for ${VERSION}; skipping checksum verification."
+        ;;
+    *)
+        err "Could not fetch ${ASSET}.sha256 (HTTP ${SUM_STATUS}); refusing to install unverified. Retry, or pin a version with LINKEDIN_MCP_VERSION."
+        ;;
+esac
 
 # ── Install ────────────────────────────────────────────────────────────────────
 
@@ -122,6 +145,7 @@ info "Installing to $INSTALL_DIR…"
 rm -rf "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 unzip -q "$TMP_PLUGIN" -d "$INSTALL_DIR"
+printf '%s\n' "$VERSION" > "$INSTALL_DIR/$MARKER"
 ok "Extracted plugin files"
 
 info "Installing Python dependencies…"

@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from contextlib import contextmanager
 from textwrap import dedent
@@ -666,19 +667,31 @@ def refresh_web_session() -> str:
 @mcp.tool()
 def clear_web_session() -> str:
     """
-    Remove the stored LinkedIn browser session cookies.
+    Remove the stored LinkedIn browser session cookies AND the persistent
+    browser profile for the active account, switching the Voyager tier off.
 
-    After clearing, get_profile and update_headline fall back to the OAuth API
-    (which cannot read/write the headline without partner-level scopes).
+    Both must go: the profile is a logged-in browser, and the server would
+    otherwise re-harvest the session from it on the next call. After clearing,
+    get_profile and update_headline fall back to the OAuth API (which cannot
+    read/write the headline without partner-level scopes) until you run
+    `authenticate` again.
     """
     with _tool_log("clear_web_session"):
         try:
             active = _active_alias()
+            _invalidate_voyager(active)  # release Chromium's lock on the profile first
             existed = delete_web_session(active)
-            _invalidate_voyager(active)
-            if existed:
+            bdir = _browser_dir(active)
+            profile_removed = os.path.isdir(bdir)
+            if profile_removed:
+                shutil.rmtree(bdir)
+                _log.info("Browser profile removed for '%s' (%s)", active, bdir)
+            if existed or profile_removed:
                 _log.info("Web session cleared for '%s'", active)
-                return f"✅ Web session cleared for '{active}'."
+                return (
+                    f"✅ Web session cleared for '{active}' (stored cookies and browser "
+                    f"profile removed). Voyager stays off until you run `authenticate` again."
+                )
             return f"ℹ️ No web session found for '{active}' — nothing to clear."
         except Exception as exc:
             return _format_error(exc)

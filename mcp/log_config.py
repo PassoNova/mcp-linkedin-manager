@@ -28,6 +28,29 @@ _FORMATTER = logging.Formatter(
 )
 
 
+class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler whose log files are always created with mode 0600.
+
+    The stock handler opens the base file with the process umask, on creation
+    and again after every rollover. The log can carry aliases, profile paths
+    and API error bodies, so every file it creates is opened via ``os.open``
+    with an explicit ``0o600`` and tightened on the descriptor if it already
+    existed with looser permissions.
+    """
+
+    def _open(self):  # type: ignore[override]
+        flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+        if self.mode.startswith("w"):
+            flags |= os.O_TRUNC
+        fd = os.open(self.baseFilename, flags, 0o600)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+        except OSError:
+            pass  # e.g. a log file owned by another user; logging still works
+        return open(fd, self.mode, encoding=self.encoding, errors=self.errors)
+
+
 def setup() -> None:
     """Configure root logger with a rotating file handler and optional stderr output."""
     root = logging.getLogger("linkedin_mcp")
@@ -38,19 +61,13 @@ def setup() -> None:
 
     # Rotating file handler — always on
     os.makedirs(os.path.dirname(os.path.abspath(LOG_FILE)), exist_ok=True)
-    fh = logging.handlers.RotatingFileHandler(
+    fh = _PrivateRotatingFileHandler(
         LOG_FILE,
         maxBytes=5 * 1024 * 1024,  # 5 MB
         backupCount=3,
         encoding="utf-8",
     )
     fh.setFormatter(_FORMATTER)
-    # The log can contain aliases, profile paths and API error bodies — keep it
-    # owner-only. RotatingFileHandler opens the file on creation, so it exists here.
-    try:
-        os.chmod(LOG_FILE, 0o600)
-    except OSError:
-        pass  # e.g. a log file owned by another user; logging still works
     root.addHandler(fh)
 
     # Console handler only when LINKEDIN_MCP_DEBUG=1

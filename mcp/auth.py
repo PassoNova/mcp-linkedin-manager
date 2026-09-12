@@ -112,7 +112,7 @@ def _browser_dir(alias: str) -> str:
     return os.path.expanduser(f"~/.linkedin_mcp_browser_{alias}")
 
 
-def _ensure_private_dir(path: str) -> None:
+def ensure_private_dir(path: str) -> None:
     """Create ``path`` (if needed) and force owner-only permissions (0700).
 
     The Playwright profile holds the live LinkedIn session cookie, so it must
@@ -129,13 +129,22 @@ def _write_private_json(path: str, data: dict) -> None:
 
     Opening with ``os.open(..., 0o600)`` avoids the window where a file created
     by ``open(path, "w")`` is readable under the default umask before a later
-    ``chmod``. An existing file keeps its inode, so its mode is re-applied too.
+    ``chmod``. The mode argument only applies to a *new* file, so an existing
+    (possibly looser) file is tightened on its descriptor before anything is
+    written to it.
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:  # pragma: no cover - Windows < 3.13
+            os.chmod(path, 0o600)
+    except OSError:
+        os.close(fd)
+        raise
     with os.fdopen(fd, "w") as fh:
         json.dump(data, fh, indent=2)
-    os.chmod(path, 0o600)
 
 
 # ── OAuth callback pages ───────────────────────────────────────────────────────
@@ -643,7 +652,7 @@ def harvest_session_from_profile(
     if not has_browser_profile(browser_dir):
         return None, None, "no browser profile — run `authenticate` first"
     try:
-        _ensure_private_dir(browser_dir)
+        ensure_private_dir(browser_dir)
         with _sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 browser_dir, headless=True, args=_LAUNCH_ARGS
@@ -677,7 +686,7 @@ def _init_headless_profile(
     """
     try:
         _log.debug("Initializing Playwright headless profile at %s", browser_dir)
-        _ensure_private_dir(browser_dir)
+        ensure_private_dir(browser_dir)
         with _sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 browser_dir, headless=True, args=_LAUNCH_ARGS
@@ -777,7 +786,7 @@ def _run_oauth_flow_playwright(
     redirect_uri = f"http://localhost:{port}/callback"
     state = secrets.token_urlsafe(16)
     auth_url = build_auth_url(client_id, redirect_uri, state)
-    _ensure_private_dir(browser_dir)
+    ensure_private_dir(browser_dir)
 
     callback = _CallbackServer(port, state)
     callback.start()

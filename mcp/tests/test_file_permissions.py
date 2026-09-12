@@ -33,13 +33,13 @@ def _permissive_umask():
         os.umask(old)
 
 
-# ── _ensure_private_dir / browser profile ─────────────────────────────────────
+# ── ensure_private_dir / browser profile ─────────────────────────────────────
 
 class TestPrivateDir:
     def test_creates_directory_with_0700(self, tmp_path):
         import auth
         target = tmp_path / "profile"
-        auth._ensure_private_dir(str(target))
+        auth.ensure_private_dir(str(target))
         assert target.is_dir() and _mode(target) == 0o700
 
     def test_tightens_existing_directory(self, tmp_path):
@@ -47,7 +47,7 @@ class TestPrivateDir:
         target = tmp_path / "profile"
         target.mkdir(mode=0o755)
         assert _mode(target) == 0o755
-        auth._ensure_private_dir(str(target))
+        auth.ensure_private_dir(str(target))
         assert _mode(target) == 0o700
 
     def test_harvest_chmods_existing_profile(self, monkeypatch, tmp_path):
@@ -81,6 +81,20 @@ class TestPrivateDir:
         monkeypatch.setattr(auth, "_sync_playwright", _fake_sync_playwright(ctx))
         auth._init_headless_profile("L", None, str(browser_dir))
         assert browser_dir.is_dir() and _mode(browser_dir) == 0o700
+
+    def test_voyager_client_launch_tightens_existing_profile(self, monkeypatch, tmp_path):
+        import client
+        profile = tmp_path / "profile"
+        profile.mkdir(mode=0o755)
+        monkeypatch.setattr(client, "_sync_playwright", MagicMock())
+        vc = client.VoyagerClient("L", "J", user_data_dir=str(profile))
+        try:
+            vc._ensure_context()
+            assert _mode(profile) == 0o700
+            launch = client._sync_playwright.return_value.__enter__.return_value.chromium.launch_persistent_context
+            assert launch.call_args[0][0] == str(profile)
+        finally:
+            vc.close()
 
 
 # ── token / session fallback files ───────────────────────────────────────────
@@ -139,3 +153,28 @@ class TestLogFile:
             for h in root.handlers:
                 h.close()
             root.handlers[:] = saved
+
+    def test_rollover_keeps_0600(self, tmp_path):
+        import log_config
+        log_file = tmp_path / "rot.log"
+        h = log_config._PrivateRotatingFileHandler(str(log_file), maxBytes=64, backupCount=2, encoding="utf-8")
+        try:
+            assert _mode(log_file) == 0o600
+            h.emit(logging.LogRecord("t", logging.INFO, __file__, 1, "x" * 100, None, None))
+            h.doRollover()
+            h.emit(logging.LogRecord("t", logging.INFO, __file__, 1, "after rollover", None, None))
+            assert log_file.exists() and _mode(log_file) == 0o600
+            assert (tmp_path / "rot.log.1").exists()
+        finally:
+            h.close()
+
+    def test_existing_loose_log_is_tightened(self, tmp_path):
+        import log_config
+        log_file = tmp_path / "loose.log"
+        log_file.write_text("old\n")
+        os.chmod(log_file, 0o644)
+        h = log_config._PrivateRotatingFileHandler(str(log_file), maxBytes=0, backupCount=0, encoding="utf-8")
+        try:
+            assert _mode(log_file) == 0o600
+        finally:
+            h.close()
