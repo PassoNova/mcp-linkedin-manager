@@ -489,3 +489,12 @@ class TestDeleteWebSessionStrict:
     def test_non_strict_still_swallows(self, tmp_path, monkeypatch):
         auth = self._kr(monkeypatch, tmp_path, delete_error=RuntimeError("locked"), read='{"li_at": "L"}')
         assert auth.delete_web_session("work") is False
+
+    def test_strict_removes_fallback_file_before_raising(self, tmp_path, monkeypatch):
+        import pytest
+        auth = self._kr(monkeypatch, tmp_path, delete_error=RuntimeError("locked"), read='{"li_at": "L"}')
+        path = tmp_path / "no_work.json"
+        path.write_text("{}")
+        with pytest.raises(RuntimeError):
+            auth.delete_web_session("work", strict=True)
+        assert not path.exists()

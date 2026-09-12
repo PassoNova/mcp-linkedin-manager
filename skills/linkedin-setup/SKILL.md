@@ -44,10 +44,11 @@ If the OS keychain is unavailable, fall back to a `.env` file:
 
 ```bash
 cp .env.example .env
+chmod 600 .env
 # Edit .env with LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET
 ```
 
-On first `authenticate`, the `.env` credentials are auto-migrated to the keychain.
+With a keychain backend, the first `authenticate` migrates the `.env` credentials to the keychain (`check_auth` shows `credentials_in_keychain: true`); without one the `.env` must stay — it is the only copy.
 
 ## Step 4 — Authenticate
 

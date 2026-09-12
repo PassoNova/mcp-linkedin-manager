@@ -11,7 +11,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cla
 | Tool | What it does |
 |---|---|
 | `authenticate` | OAuth 2.0 browser flow for a named alias (e.g. `work`, `personal`) |
-| `logout` | Remove one user's credentials (defaults to active account) |
+| `logout` | Remove an account's OAuth token, web session **and** browser profile, and unregister the alias |
 | `check_auth` | Show active user's token status, capability tier, scopes, and keychain status |
 | `switch_user` | Set the active LinkedIn account by alias |
 | `list_users` | List all registered aliases with their auth status and tier |
@@ -117,10 +117,11 @@ This prompts for your Client ID and Client Secret interactively (secret input, n
 ```bash
 cd linkedin-mcp/mcp
 cp .env.example .env
+chmod 600 .env
 # Edit .env and fill in LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET
 ```
 
-On first `authenticate`, credentials are auto-migrated from the `.env` file to the keychain and you can delete the file afterward.
+When a keychain backend is available, the first `authenticate` migrates the credentials from `.env` to the keychain (check with `check_auth` → `credentials_in_keychain: true`) and you can delete the file. Without a keychain backend nothing is migrated — the `.env` stays the source of the credentials, so keep it.
 
 ### 3. Install dependencies
 

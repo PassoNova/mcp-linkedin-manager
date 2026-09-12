@@ -79,9 +79,10 @@ No `.env` file is created. You do not need to set any environment variables.
 **Alternative (`.env` fallback):** if the OS keychain is unavailable:
 ```bash
 cp .env.example .env
+chmod 600 .env
 # Edit .env with LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET
 ```
-On the first `authenticate` call, the `.env` values are auto-migrated to the keychain.
+With a keychain backend, the first `authenticate` migrates the `.env` values to the keychain (`check_auth` reports `credentials_in_keychain: true`) and the file can then be deleted. Without one, nothing is migrated and the `.env` must stay.
 
 ---
 

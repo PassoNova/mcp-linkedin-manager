@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 from contextlib import contextmanager
 from textwrap import dedent
@@ -172,6 +173,29 @@ def _get_client(alias: Optional[str] = None) -> LinkedInClient:
 
 _voyager_singletons: dict[str, VoyagerClient] = {}
 _voyager_session_keys: dict[str, str] = {}
+# Serialises singleton creation/eviction with profile removal, so a concurrent
+# tool call cannot re-open (or re-create) a profile while it is being deleted.
+_voyager_lock = threading.RLock()
+
+
+def _remove_browser_profile(alias: str) -> bool:
+    """Delete the alias's persistent Playwright profile. Returns True if one was removed.
+
+    The alias comes from the persisted registry, so it is re-validated here and
+    the path must be a real directory (not a symlink) before ``rmtree`` runs.
+    """
+    try:
+        validate_alias(alias)
+    except ValueError as exc:
+        raise ValueError(f"refusing to remove a browser profile for invalid alias {alias!r}: {exc}") from exc
+    bdir = _browser_dir(alias)
+    if os.path.islink(bdir):
+        raise ValueError(f"refusing to remove {bdir}: it is a symlink")
+    if not os.path.isdir(bdir):
+        return False
+    shutil.rmtree(bdir)
+    _log.info("Browser profile removed for '%s' (%s)", alias, bdir)
+    return True
 
 
 def _recover_session_from_profile(alias: str) -> Optional[dict]:
@@ -197,6 +221,11 @@ def _recover_session_from_profile(alias: str) -> Optional[dict]:
 
 def _get_voyager_client(alias: Optional[str] = None) -> Optional[VoyagerClient]:
     """Return a reusable VoyagerClient for alias, creating one only when session changes."""
+    with _voyager_lock:
+        return _get_voyager_client_unlocked(alias)
+
+
+def _get_voyager_client_unlocked(alias: Optional[str] = None) -> Optional[VoyagerClient]:
     alias = alias or _active_alias()
     session = load_web_session(alias)
     if not session:
@@ -225,6 +254,11 @@ def _get_voyager_client(alias: Optional[str] = None) -> Optional[VoyagerClient]:
 
 def _invalidate_voyager(alias: Optional[str] = None) -> None:
     """Close and evict Voyager singleton(s). Pass alias to target one; None clears all."""
+    with _voyager_lock:
+        _invalidate_voyager_unlocked(alias)
+
+
+def _invalidate_voyager_unlocked(alias: Optional[str] = None) -> None:
     if alias is not None:
         if alias in _voyager_singletons:
             _log.debug("Invalidating VoyagerClient for '%s'", alias)
@@ -345,7 +379,8 @@ async def authenticate(alias: str) -> str:
 @mcp.tool()
 def logout(alias: str = "") -> str:
     """
-    Remove a user's credentials and unregister the alias.
+    Remove a user's credentials — OAuth token, web session cookies and the
+    logged-in browser profile — and unregister the alias.
 
     Args:
         alias: Which account to log out. Leave empty to log out the active account.
@@ -353,9 +388,11 @@ def logout(alias: str = "") -> str:
     with _tool_log("logout", alias=alias or "(active)"):
         try:
             target = alias.strip() or _active_alias()
-            delete_token(target)
-            delete_web_session(target)
-            _invalidate_voyager(target)
+            with _voyager_lock:
+                _invalidate_voyager(target)  # release Chromium's lock on the profile first
+                _remove_browser_profile(target)
+                delete_token(target)
+                delete_web_session(target)
             deregister_alias(target)
             _log.info("Logged out '%s'", target)
             return f"✅ '{target}' logged out and removed."
@@ -679,25 +716,23 @@ def clear_web_session() -> str:
     with _tool_log("clear_web_session"):
         try:
             active = _active_alias()
-            _invalidate_voyager(active)  # release Chromium's lock on the profile first
-            # Profile first: if its removal fails, the stored session is left in
-            # place so a logged-in profile is never left behind for recovery.
-            bdir = _browser_dir(active)
-            profile_removed = os.path.isdir(bdir)
-            if profile_removed:
-                shutil.rmtree(bdir)
-                _log.info("Browser profile removed for '%s' (%s)", active, bdir)
-            try:
-                # strict: a keychain failure raises instead of being swallowed, so
-                # success is never reported while a live li_at survives there.
-                existed = delete_web_session(active, strict=True)
-            except RuntimeError as exc:
-                _log.warning("clear_web_session: %s", exc)
-                return (
-                    f"❌ Browser profile removed, but the stored web session for '{active}' "
-                    f"could not be removed from the OS keychain ({exc}). Delete the "
-                    f"`linkedin-mcp / session:{active}` entry manually and re-run."
-                )
+            with _voyager_lock:
+                _invalidate_voyager(active)  # release Chromium's lock on the profile first
+                # Profile first: if its removal fails, the stored session is left in
+                # place so a logged-in profile is never left behind for recovery.
+                profile_removed = _remove_browser_profile(active)
+                try:
+                    # strict: a keychain failure raises instead of being swallowed, so
+                    # success is never reported while a live li_at survives there.
+                    existed = delete_web_session(active, strict=True)
+                except RuntimeError as exc:
+                    _log.warning("clear_web_session: %s", exc)
+                    return (
+                        f"❌ Browser profile and session file removed, but the stored web "
+                        f"session for '{active}' could not be removed from the OS keychain "
+                        f"({exc}). Delete the `linkedin-mcp / session:{active}` entry manually "
+                        f"and re-run."
+                    )
             if existed or profile_removed:
                 _log.info("Web session cleared for '%s'", active)
                 return (

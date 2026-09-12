@@ -190,3 +190,37 @@ class TestClearWebSessionRemovesProfile:
         out = server.clear_web_session()
         assert out.startswith("❌") and "keychain" in out and "locked" in out
         assert calls == [{"strict": True}]
+
+    def test_invalid_alias_is_refused_before_rmtree(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        monkeypatch.setattr(server, "_active_alias", lambda: "../evil")
+        monkeypatch.setattr(server, "delete_web_session", lambda alias, **kw: True)
+        rm = MagicMock()
+        monkeypatch.setattr(server.shutil, "rmtree", rm)
+        out = server.clear_web_session()
+        assert out.startswith("❌") and "invalid alias" in out
+        rm.assert_not_called()
+
+    def test_symlinked_profile_is_refused(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (tmp_path / "profile_work").symlink_to(target)
+        monkeypatch.setattr(server, "delete_web_session", lambda alias, **kw: True)
+        out = server.clear_web_session()
+        assert out.startswith("❌") and "symlink" in out
+        assert target.exists()
+
+
+class TestLogoutRemovesProfile:
+    def test_logout_deletes_profile_token_and_session(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        profile = _make_profile(tmp_path)
+        calls = []
+        monkeypatch.setattr(server, "delete_token", lambda alias: calls.append(("token", alias)))
+        monkeypatch.setattr(server, "delete_web_session", lambda alias, **kw: calls.append(("session", alias)))
+        monkeypatch.setattr(server, "deregister_alias", lambda alias: calls.append(("dereg", alias)))
+        out = server.logout("work")
+        assert out.startswith("✅")
+        assert not profile.exists()
+        assert calls == [("token", "work"), ("session", "work"), ("dereg", "work")]

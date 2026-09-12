@@ -139,6 +139,21 @@ class TestPrivateFiles:
         assert _mode(path) == 0o600
         assert json.loads(path.read_text()) == {"a": 1}
 
+    def test_loose_files_are_tightened_when_read(self, tmp_path, monkeypatch):
+        import auth
+        tok = tmp_path / "token_work.json"
+        ses = tmp_path / "session_work.json"
+        tok.write_text('{"access_token": "x"}')
+        ses.write_text('{"li_at": "L", "jsessionid": "J"}')
+        for f in (tok, ses):
+            os.chmod(f, 0o644)
+        monkeypatch.setattr(auth, "_HAS_KEYRING", False)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tok))
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(ses))
+        assert auth.load_token("work")["access_token"] == "x"
+        assert auth.load_web_session("work")["li_at"] == "L"
+        assert _mode(tok) == 0o600 and _mode(ses) == 0o600
+
     def test_write_private_json_creates_parent_dirs(self, tmp_path):
         import auth
         path = tmp_path / "nested" / "dir" / "f.json"

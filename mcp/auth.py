@@ -127,6 +127,20 @@ def ensure_private_dir(path: str) -> None:
     os.chmod(path, 0o700)
 
 
+def _tighten_private_file(path: str) -> None:
+    """Re-apply 0600 to an existing fallback file before it is read.
+
+    Files written by older versions may still be 0644; reading them is the
+    common path (writes only happen at login), so tighten here as well.
+    """
+    if not os.path.exists(path):
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        _log.warning("Could not make %s owner-only: %s", path, exc)
+
+
 def _write_private_json(path: str, data: dict) -> None:
     """Write ``data`` as JSON to ``path`` with mode 0600 from the moment it exists.
 
@@ -1031,6 +1045,7 @@ def load_token(alias: str) -> Optional[dict]:
     path = _token_path(alias)
     if not os.path.exists(path):
         return None
+    _tighten_private_file(path)
     with open(path) as fh:
         return json.load(fh)
 
@@ -1096,6 +1111,7 @@ def load_web_session(alias: str) -> Optional[dict]:
     path = _session_path(alias)
     if not os.path.exists(path):
         return None
+    _tighten_private_file(path)
     with open(path) as fh:
         return json.load(fh)
 
@@ -1110,6 +1126,12 @@ def delete_web_session(alias: str, *, strict: bool = False) -> bool:
     """
     key = f"{_KR_KEY}:{alias}"
     deleted = False
+    # Fallback file first, so a keychain failure raised below never leaves the
+    # file copy behind.
+    path = _session_path(alias)
+    if os.path.exists(path):
+        os.remove(path)
+        deleted = True
     if _HAS_KEYRING:
         try:
             keyring.delete_password(_KR_SERVICE, key)
@@ -1130,10 +1152,6 @@ def delete_web_session(alias: str, *, strict: bool = False) -> bool:
                     ) from exc
             else:
                 _log.debug("Keychain delete for '%s' failed: %s", alias, exc)
-    path = _session_path(alias)
-    if os.path.exists(path):
-        os.remove(path)
-        deleted = True
     _log.debug("Web session for '%s' deleted: %s", alias, deleted)
     return deleted
 
