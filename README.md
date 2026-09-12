@@ -17,7 +17,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cla
 | `list_users` | List all registered aliases with their auth status and tier |
 | `refresh_web_session` | Re-read the LinkedIn session from the persistent browser profile (no browser interaction) |
 | `set_web_session` | Manually store `li_at` + `JSESSIONID` cookies for the active account |
-| `clear_web_session` | Delete the stored session cookies **and** the logged-in browser profile — switches Voyager off until the next `authenticate` |
+| `clear_web_session` | Delete the stored session cookies **and** the logged-in browser profile — switches Voyager off until a session is deliberately stored again (`authenticate`, `set_web_session`, or `refresh_web_session` against a still-logged-in profile) |
 | `clear_credentials` | Remove shared app credentials (Client ID + Secret) from the OS keychain |
 
 ### Profile & content tools

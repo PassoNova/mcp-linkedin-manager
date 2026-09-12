@@ -63,7 +63,7 @@ conversations, none of which the official Consumer API exposes.
   rejected; the server does not pre-validate cookies.) `clear_web_session` switches it off: it deletes the
   stored cookies **and** the per-alias browser profile (the server would
   otherwise re-harvest the session from the still-logged-in profile on the
-  next call). Voyager stays off until you run `authenticate` again.
+  next call). Voyager stays off until a session is deliberately stored again (`authenticate`, `set_web_session`, or `refresh_web_session` against a still-logged-in profile).
 - Use it only on your own account, at your own risk, and keep request volume
   low. The server does not add retries or parallelism on Voyager endpoints
   beyond what a normal browsing session would generate.

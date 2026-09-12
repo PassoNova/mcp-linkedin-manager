@@ -149,19 +149,19 @@ def check_credentials() -> bool:
         print(f"  {PASS} App credentials found in environment (LINKEDIN_CLIENT_ID={client_id[:8]}…)")
         return True
 
-    # Check both mcp/.env and repo root .env
-    dotenv_path = next(
-        (p for p in [
-            os.path.join(_MCP_DIR, ".env"),
-            os.path.join(os.path.dirname(__file__), "..", ".env"),
-        ] if os.path.exists(p)),
-        None,
-    )
-    if dotenv_path:
+    # The server loads exactly mcp/.env (explicit path, no upward search), so
+    # that is the only file that counts here. A repository-root .env is legacy:
+    # report it so the user migrates it, but never count it as credentials.
+    legacy_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+    if os.path.exists(legacy_path):
+        print(f"  {WARN} Found a repository-root .env; the server does not read it. "
+              "Move those credentials to the keychain (python -m linkedin_mcp setup) and delete it.")
+    dotenv_path = os.path.join(_MCP_DIR, ".env")
+    if os.path.exists(dotenv_path):
         from dotenv import dotenv_values
         env = dotenv_values(dotenv_path)
         if env.get("LINKEDIN_CLIENT_ID") and env.get("LINKEDIN_CLIENT_SECRET"):
-            print(f"  {PASS} App credentials found in .env file")
+            print(f"  {PASS} App credentials found in mcp/.env")
             return True
 
     print(f"  {FAIL} No app credentials found.")

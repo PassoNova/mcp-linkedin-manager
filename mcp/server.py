@@ -303,6 +303,19 @@ def _get_voyager_client_unlocked(alias: Optional[str] = None) -> Optional[Voyage
         _log.debug("No web session for '%s'; Voyager unavailable", alias)
         return None
     key = session.get("li_at", "")
+    existing = _voyager_singletons.get(alias)
+    if existing is not None and getattr(existing, "_closed", False):
+        # close() marked it permanently closed (possibly after a teardown timeout);
+        # never hand it out again. Retry the teardown, then rebuild below.
+        try:
+            existing.close()
+        except Exception as exc:
+            _log.warning("VoyagerClient for '%s' still closing (%s); not replacing it yet", alias, exc)
+            raise RuntimeError(
+                "The previous Voyager session is still shutting down; try again in a moment."
+            ) from exc
+        del _voyager_singletons[alias]
+        _voyager_session_keys.pop(alias, None)
     if alias not in _voyager_singletons or key != _voyager_session_keys.get(alias):
         if alias in _voyager_singletons:
             _log.debug("Session changed for '%s'; recycling VoyagerClient", alias)
@@ -876,8 +889,9 @@ def clear_web_session() -> str:
     Both must go: the profile is a logged-in browser, and the server would
     otherwise re-harvest the session from it on the next call. After clearing,
     get_profile and update_headline fall back to the OAuth API (which cannot
-    read/write the headline without partner-level scopes) until you run
-    `authenticate` again.
+    read/write the headline without partner-level scopes) until a session is
+    deliberately stored again: `authenticate`, `set_web_session`, or
+    `refresh_web_session` against a profile that is logged in again.
     """
     with _tool_log("clear_web_session"):
         try:
@@ -908,7 +922,8 @@ def clear_web_session() -> str:
                 )
                 return (
                     f"✅ Web session cleared for '{active}' ({removed}). "
-                    "Voyager stays off until you run `authenticate` again."
+                    "Voyager stays off until a session is deliberately stored again "
+                    "(`authenticate`, `set_web_session`, or `refresh_web_session`)."
                 )
             return f"ℹ️ No web session found for '{active}' — nothing to clear."
         except Exception as exc:
