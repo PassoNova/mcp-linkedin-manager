@@ -113,3 +113,7 @@ Accepted for now; each is bounded and documented so nobody has to rediscover it.
 - **Pre-marker installs.** `scripts/install.sh` will not delete an install
   made before the `.linkedin-mcp-install` marker existed; remove it by hand
   once, as the error message says.
+- **`install.sh` emptiness test.** The "is the target directory empty?" check
+  parses `ls -A`; a directory whose only entries are names made solely of
+  newline characters reads as empty and would be replaced. Such names do not
+  occur in practice and the marker/git/`$HOME`/`/` guards still apply.
