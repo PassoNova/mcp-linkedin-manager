@@ -9,7 +9,8 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MCP_DIR="$PROJECT_DIR/mcp"
-ENV_FILE="$PROJECT_DIR/.env"
+ENV_FILE="$MCP_DIR/.env"          # what load_dotenv() reads (cwd is mcp/)
+LEGACY_ENV_FILE="$PROJECT_DIR/.env"  # older layout; the server no longer reads it
 
 echo ""
 echo "╔══════════════════════════════════════════╗"
@@ -66,6 +67,10 @@ if [ -n "${LINKEDIN_CLIENT_ID:-}" ] || [ -n "${LINKEDIN_CLIENT_SECRET:-}" ]; the
     echo "   persisted or registered by this script (that would store the secret in"
     echo "   plaintext in Claude's config). Store them in the keychain instead:"
     echo "     cd $MCP_DIR && uv run python -m linkedin_mcp setup"
+fi
+if [ -f "$LEGACY_ENV_FILE" ] && grep -qE '^LINKEDIN_CLIENT_SECRET=.+' "$LEGACY_ENV_FILE"; then
+    echo "⚠️  Found $LEGACY_ENV_FILE with a client secret, but the server reads mcp/.env, not the repo root."
+    echo "    Move it to the keychain with: python -m linkedin_mcp setup   (then delete the root .env)"
 fi
 if [ -f "$ENV_FILE" ] && grep -qE '^LINKEDIN_CLIENT_SECRET=.+' "$ENV_FILE"; then
     echo "ℹ️  Found $ENV_FILE — the server reads it as a fallback; run the setup"

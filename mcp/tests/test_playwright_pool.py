@@ -81,7 +81,7 @@ class TestEnsureContext:
         mock_atexit = mocker.patch("client.atexit.register")
         vc = _make_vc()
         vc._ensure_context()
-        mock_atexit.assert_called_once_with(vc.close)
+        mock_atexit.assert_called_once_with(vc._close_quietly)
 
 
 # ---------------------------------------------------------------------------

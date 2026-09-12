@@ -516,6 +516,7 @@ def logout(alias: str = "") -> str:
     with _tool_log("logout", alias=alias or "(active)"):
         try:
             target = alias.strip() or _active_alias()
+            validate_alias(target)  # before any per-alias state is created for it
             with _alias_lock(target):
                 _bump_generation(target)  # any in-flight login/validation must not save
                 _invalidate_voyager(target)  # release Chromium's lock on the profile first

@@ -389,13 +389,15 @@ class VoyagerClient:
     def _ensure_context(self) -> None:
         """Launch the persistent Playwright context on first use; reuse on subsequent calls."""
         with self._lock:
-            if self._context is not None:
-                return
+            # Closed check first: close() flips the flag before the teardown is
+            # queued, so a call racing it must not take the live-context fast path.
             if self._closed:
                 raise RuntimeError(
                     "VoyagerClient is closed (the session was cleared or replaced); "
                     "obtain a fresh client instead of reusing this one."
                 )
+            if self._context is not None:
+                return
             if not self._user_data_dir:
                 raise RuntimeError(
                     "No persistent browser profile found. "
@@ -429,7 +431,7 @@ class VoyagerClient:
                 _log.debug("VoyagerClient: profile already holds a LinkedIn session; keeping it")
             else:
                 self._inject_cookies()
-            atexit.register(self.close)
+            atexit.register(self._close_quietly)
             _log.info("VoyagerClient: Playwright context ready at %s", self._user_data_dir)
 
     def _check_open(self) -> None:
@@ -437,26 +439,41 @@ class VoyagerClient:
             raise RuntimeError("VoyagerClient is closed; the web session was cleared or replaced")
 
     def _teardown(self) -> None:
-        """Release the Playwright objects. Must run on the thread that created them."""
+        """Release the Playwright objects. Must run on the thread that created them.
+
+        Every step is attempted (best effort), but a failure is re-raised at the
+        end so close() cannot report a clean shutdown while Chromium may still
+        hold the profile; callers then refuse to delete that profile.
+        """
+        errors: list[str] = []
         with self._lock:
             try:
                 if self._page is not None:
                     self._page.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"page.close: {exc}")
             try:
                 if self._context is not None:
                     self._context.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"context.close: {exc}")
             try:
                 if self._playwright is not None:
                     self._playwright.__exit__(None, None, None)
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"playwright.stop: {exc}")
             self._page = None
             self._context = None
             self._playwright = None
+        if errors:
+            raise RuntimeError("VoyagerClient teardown incomplete: " + "; ".join(errors))
+
+    def _close_quietly(self) -> None:
+        """atexit hook: best-effort close that never raises during interpreter shutdown."""
+        try:
+            self.close()
+        except Exception as exc:
+            _log.warning("VoyagerClient: close at exit failed: %s", exc)
 
     def close(self) -> None:
         """Close the persistent browser context and release Playwright.
