@@ -173,29 +173,53 @@ def _get_client(alias: Optional[str] = None) -> LinkedInClient:
 
 _voyager_singletons: dict[str, VoyagerClient] = {}
 _voyager_session_keys: dict[str, str] = {}
-# Serialises singleton creation/eviction with profile removal, so a concurrent
-# tool call cannot re-open (or re-create) a profile while it is being deleted.
-_voyager_lock = threading.RLock()
+# Per-alias lifecycle locks: serialise singleton creation/eviction, session
+# persistence and profile removal for one account, so a concurrent tool call
+# cannot re-open (or re-create) a profile while it is being deleted — without a
+# slow profile for one alias blocking every other alias.
+_alias_locks: dict[str, threading.RLock] = {}
+_alias_locks_guard = threading.Lock()
 # Per-alias lifecycle generation: bumped by clear_web_session / logout. Flows
 # that own the profile for a while (OAuth login, set_web_session validation)
 # capture it first and only persist their cookies if it is unchanged, so a
 # clear that happened mid-flight cannot be undone by a late save.
 _session_generation: dict[str, int] = {}
+# Aliases cleared/logged out since the last persisted session. While an alias
+# is here, profile recovery is refused: a profile can only exist because a flow
+# that was in progress during the clear (re)created it, and its cookies must
+# not silently re-enable Voyager. Persisting a session again lifts it.
+_cleared_pending: set[str] = set()
+
+
+def _alias_lock(alias: str) -> threading.RLock:
+    with _alias_locks_guard:
+        lock = _alias_locks.get(alias)
+        if lock is None:
+            lock = _alias_locks[alias] = threading.RLock()
+        return lock
 
 
 def _lifecycle_generation(alias: str) -> int:
-    with _voyager_lock:
+    with _alias_lock(alias):
         return _session_generation.get(alias, 0)
 
 
 def _bump_generation(alias: str) -> None:
-    with _voyager_lock:
+    """Mark the alias as cleared: invalidates in-flight saves and blocks profile recovery."""
+    with _alias_lock(alias):
         _session_generation[alias] = _session_generation.get(alias, 0) + 1
+        _cleared_pending.add(alias)
+
+
+def _session_persisted(alias: str) -> None:
+    """A session was (re)stored on purpose; profile recovery is allowed again."""
+    with _alias_lock(alias):
+        _cleared_pending.discard(alias)
 
 
 def _save_session_if_current(li_at: str, jsessionid: str, alias: str, generation: int) -> bool:
     """Persist the web session unless the alias was cleared since *generation* was read."""
-    with _voyager_lock:
+    with _alias_lock(alias):
         if _session_generation.get(alias, 0) != generation:
             _log.warning(
                 "Web session for '%s' was cleared while a login/validation was in progress; discarding it",
@@ -203,6 +227,7 @@ def _save_session_if_current(li_at: str, jsessionid: str, alias: str, generation
             )
             return False
         save_web_session(li_at, jsessionid, alias)
+        _session_persisted(alias)
         return True
 
 
@@ -228,7 +253,7 @@ def _remove_browser_profile(alias: str) -> bool:
 
 def _recover_session_from_profile(alias: str) -> Optional[dict]:
     """Re-read the LinkedIn session from the alias's persistent Playwright profile (locked)."""
-    with _voyager_lock:
+    with _alias_lock(alias):
         return _recover_session_from_profile_unlocked(alias)
 
 
@@ -240,6 +265,9 @@ def _recover_session_from_profile_unlocked(alias: str) -> Optional[dict]:
     or the session entry was cleared). Persists what it finds so the next call
     is a plain keychain read. Returns the session dict or None.
     """
+    if alias in _cleared_pending:
+        _log.info("Not recovering a session for '%s': it was cleared and not re-authenticated", alias)
+        return None
     bdir = _browser_dir(alias)
     if not has_browser_profile(bdir):
         return None
@@ -255,7 +283,8 @@ def _recover_session_from_profile_unlocked(alias: str) -> Optional[dict]:
 
 def _get_voyager_client(alias: Optional[str] = None) -> Optional[VoyagerClient]:
     """Return a reusable VoyagerClient for alias, creating one only when session changes."""
-    with _voyager_lock:
+    alias = alias or _active_alias()
+    with _alias_lock(alias):
         return _get_voyager_client_unlocked(alias)
 
 
@@ -288,7 +317,12 @@ def _get_voyager_client_unlocked(alias: Optional[str] = None) -> Optional[Voyage
 
 def _invalidate_voyager(alias: Optional[str] = None) -> None:
     """Close and evict Voyager singleton(s). Pass alias to target one; None clears all."""
-    with _voyager_lock:
+    if alias is None:
+        for known in list(_voyager_singletons):
+            with _alias_lock(known):
+                _invalidate_voyager_unlocked(known)
+        return
+    with _alias_lock(alias):
         _invalidate_voyager_unlocked(alias)
 
 
@@ -362,7 +396,7 @@ async def authenticate(alias: str) -> str:
             result = await run_oauth_flow(
                 client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
             )
-            with _voyager_lock:
+            with _alias_lock(alias):
                 if _lifecycle_generation(alias) != generation:
                     # clear_web_session / logout ran while the window was open: persist
                     # nothing (token, registry, cookies) and drop whatever the flow
@@ -442,7 +476,7 @@ def logout(alias: str = "") -> str:
     with _tool_log("logout", alias=alias or "(active)"):
         try:
             target = alias.strip() or _active_alias()
-            with _voyager_lock:
+            with _alias_lock(target):
                 _bump_generation(target)  # any in-flight login/validation must not save
                 _invalidate_voyager(target)  # release Chromium's lock on the profile first
                 _remove_browser_profile(target)
@@ -458,7 +492,7 @@ def logout(alias: str = "") -> str:
                         f"fix the keychain (or delete the `linkedin-mcp` entries for "
                         f"'{target}' manually) and run `logout` again."
                     )
-            deregister_alias(target)
+                deregister_alias(target)  # inside the lock: no authenticate can cross this boundary
             _log.info("Logged out '%s'", target)
             return f"✅ '{target}' logged out and removed."
         except Exception as exc:
@@ -711,7 +745,7 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
             name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
             headline = me.get("headline", "")
             if not _save_session_if_current(li_at, jsessionid, active, generation):
-                with _voyager_lock:
+                with _alias_lock(active):
                     _remove_browser_profile(active)  # validation may have re-created it
                 return (
                     f"❌ Not saved: the web session for '{active}' was cleared while it was "
@@ -754,7 +788,7 @@ def refresh_web_session() -> str:
                     f"❌ No browser profile for '{active}'. Run `authenticate` first "
                     "(the Playwright login window creates it)."
                 )
-            with _voyager_lock:  # never interleave with clear_web_session / logout
+            with _alias_lock(active):  # never interleave with clear_web_session / logout
                 _invalidate_voyager(active)  # Chromium locks the profile; free it first
                 li_at, jsessionid, err = _run_in_thread(harvest_session_from_profile, bdir)
                 if not li_at:
@@ -764,6 +798,7 @@ def refresh_web_session() -> str:
                         "or use `set_web_session`."
                     )
                 save_web_session(li_at, jsessionid or "", active)
+                _session_persisted(active)
             _log.info("Web session refreshed for '%s' from browser profile", active)
             return (
                 f"✅ Web session refreshed for '{active}' from the browser profile.\n"
@@ -789,7 +824,7 @@ def clear_web_session() -> str:
     with _tool_log("clear_web_session"):
         try:
             active = _active_alias()
-            with _voyager_lock:
+            with _alias_lock(active):
                 _bump_generation(active)  # any in-flight login/validation must not save
                 _invalidate_voyager(active)  # release Chromium's lock on the profile first
                 # Profile first: if its removal fails, the stored session is left in

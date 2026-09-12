@@ -1037,6 +1037,8 @@ async def run_oauth_flow(
 def save_token(token_data: dict, alias: str) -> None:
     """Persist token_data to OS keychain under alias, falling back to a per-alias file."""
     key = f"{_KR_KEY_TOKEN}:{alias}"
+    path = _token_path(alias)
+    _tighten_private_file(path)  # a stale file copy is fixed even when the keychain wins
     if _HAS_KEYRING:
         try:
             keyring.set_password(_KR_SERVICE, key, json.dumps(token_data))
@@ -1044,7 +1046,6 @@ def save_token(token_data: dict, alias: str) -> None:
             return
         except Exception as exc:
             _log.debug("Keychain save failed, using file: %s", exc)
-    path = _token_path(alias)
     _write_private_json(path, token_data)
     _log.debug("Token for '%s' saved to %s", alias, path)
 
@@ -1133,6 +1134,8 @@ def save_web_session(li_at: str, jsessionid: str, alias: str) -> None:
     """Persist li_at and JSESSIONID cookies for alias, preferring OS keychain."""
     key = f"{_KR_KEY}:{alias}"
     data = {"li_at": li_at, "jsessionid": jsessionid, "_saved_at": int(time.time())}
+    path = _session_path(alias)
+    _tighten_private_file(path)  # a stale file copy is fixed even when the keychain wins
     if _HAS_KEYRING:
         try:
             keyring.set_password(_KR_SERVICE, key, json.dumps(data))
@@ -1140,7 +1143,6 @@ def save_web_session(li_at: str, jsessionid: str, alias: str) -> None:
             return
         except Exception as exc:
             _log.debug("Keychain session save failed, using file: %s", exc)
-    path = _session_path(alias)
     _write_private_json(path, data)
     _log.debug("Web session for '%s' saved to %s", alias, path)
 

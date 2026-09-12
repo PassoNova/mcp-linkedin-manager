@@ -222,6 +222,18 @@ class TestPrivateFiles:
             auth._write_private_json(str(link), {"a": 1})
         assert real.read_text() == "keep"
 
+    def test_save_tightens_stale_file_even_when_keychain_wins(self, tmp_path, monkeypatch):
+        import auth
+        tok = tmp_path / "token_work.json"
+        tok.write_text('{"access_token": "stale"}')
+        os.chmod(tok, 0o644)
+        monkeypatch.setattr(auth, "_HAS_KEYRING", True)
+        monkeypatch.setattr(auth, "keyring", MagicMock())
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(tok))
+        auth.save_token({"access_token": "new"}, "work")
+        assert _mode(tok) == 0o600
+        assert json.loads(tok.read_text())["access_token"] == "stale"  # keychain won; file untouched
+
     def test_write_private_json_creates_parent_dirs(self, tmp_path):
         import auth
         path = tmp_path / "nested" / "dir" / "f.json"

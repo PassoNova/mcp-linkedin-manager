@@ -37,6 +37,8 @@ def srv(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "VoyagerClient", MagicMock())
     server._voyager_singletons.clear()
     server._voyager_session_keys.clear()
+    server._cleared_pending.clear()
+    server._session_generation.clear()
     yield server, store, tmp_path
     server._voyager_singletons.clear()
     server._voyager_session_keys.clear()
@@ -308,3 +310,28 @@ class TestLifecycleGeneration:
         out = asyncio.run(server.authenticate("work"))
         assert out.startswith("✅") or "Voyager" in out
         assert writes == [("token", "work"), ("register", "work")] and store["work"]["li_at"] == "L"
+
+
+class TestRecoveryRefusedAfterClear:
+    def test_recovery_refused_until_session_persisted_again(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        _make_profile(tmp_path)
+        store["work"] = {"li_at": "L", "jsessionid": "J"}
+        monkeypatch.setattr(server, "delete_web_session", lambda alias, **kw: store.pop(alias, None) is not None)
+        monkeypatch.setattr(server, "harvest_session_from_profile", lambda bdir: ("L2", "J2", None))
+        assert server.clear_web_session().startswith("✅")
+        _make_profile(tmp_path)  # an in-flight flow re-created the profile after the clear
+        assert server._recover_session_from_profile("work") is None
+        assert server._get_voyager_client("work") is None and "work" not in store
+        # A deliberate re-authentication stores a session and lifts the block.
+        assert server._save_session_if_current("L3", "J3", "work", server._lifecycle_generation("work"))
+        store.pop("work")
+        assert server._recover_session_from_profile("work") == {"li_at": "L2", "jsessionid": "J2"}
+
+    def test_invalidate_all_still_clears_every_singleton(self, srv):
+        server, store, tmp_path = srv
+        a, b = MagicMock(), MagicMock()
+        server._voyager_singletons.update({"a": a, "b": b})
+        server._invalidate_voyager(None)
+        assert server._voyager_singletons == {}
+        a.close.assert_called_once(); b.close.assert_called_once()
