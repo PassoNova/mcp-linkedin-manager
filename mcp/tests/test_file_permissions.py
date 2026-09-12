@@ -50,6 +50,16 @@ class TestPrivateDir:
         auth.ensure_private_dir(str(target))
         assert _mode(target) == 0o700
 
+    def test_has_browser_profile_tightens_before_listing(self, tmp_path):
+        import auth
+        profile = tmp_path / "profile"
+        profile.mkdir(mode=0o755)
+        (profile / "Default").mkdir()
+        assert auth.has_browser_profile(str(profile)) is True
+        assert _mode(profile) == 0o700
+        assert auth.has_browser_profile(str(tmp_path / "missing")) is False
+        assert not (tmp_path / "missing").exists()
+
     def test_harvest_chmods_existing_profile(self, monkeypatch, tmp_path):
         import auth
         (tmp_path / "Default").mkdir()

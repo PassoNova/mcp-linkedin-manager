@@ -687,13 +687,16 @@ def clear_web_session() -> str:
             if profile_removed:
                 shutil.rmtree(bdir)
                 _log.info("Browser profile removed for '%s' (%s)", active, bdir)
-            existed = delete_web_session(active)
-            if load_web_session(active) is not None:
-                # delete_web_session swallows keychain errors; verify, don't trust.
+            try:
+                # strict: a keychain failure raises instead of being swallowed, so
+                # success is never reported while a live li_at survives there.
+                existed = delete_web_session(active, strict=True)
+            except RuntimeError as exc:
+                _log.warning("clear_web_session: %s", exc)
                 return (
-                    f"❌ Could not remove the stored web session for '{active}' from the "
-                    f"OS keychain — check the log, or delete the `linkedin-mcp / session:{active}` "
-                    f"entry manually."
+                    f"❌ Browser profile removed, but the stored web session for '{active}' "
+                    f"could not be removed from the OS keychain ({exc}). Delete the "
+                    f"`linkedin-mcp / session:{active}` entry manually and re-run."
                 )
             if existed or profile_removed:
                 _log.info("Web session cleared for '%s'", active)

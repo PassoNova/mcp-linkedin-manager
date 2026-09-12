@@ -148,7 +148,7 @@ class TestClearWebSessionRemovesProfile:
         server, store, tmp_path = srv
         profile = _make_profile(tmp_path)
         store["work"] = {"li_at": "L", "jsessionid": "J"}
-        monkeypatch.setattr(server, "delete_web_session", lambda alias: store.pop(alias, None) is not None)
+        monkeypatch.setattr(server, "delete_web_session", lambda alias, **kw: store.pop(alias, None) is not None)
         out = server.clear_web_session()
         assert "profile removed" in out
         assert not profile.exists()
@@ -157,13 +157,13 @@ class TestClearWebSessionRemovesProfile:
     def test_profile_only_still_reports_cleared(self, srv, monkeypatch):
         server, store, tmp_path = srv
         profile = _make_profile(tmp_path)
-        monkeypatch.setattr(server, "delete_web_session", lambda alias: False)
+        monkeypatch.setattr(server, "delete_web_session", lambda alias, **kw: False)
         out = server.clear_web_session()
         assert out.startswith("✅") and not profile.exists()
 
     def test_nothing_to_clear(self, srv, monkeypatch):
         server, _, _ = srv
-        monkeypatch.setattr(server, "delete_web_session", lambda alias: False)
+        monkeypatch.setattr(server, "delete_web_session", lambda alias, **kw: False)
         assert server.clear_web_session().startswith("ℹ️")
 
     def test_profile_removal_failure_keeps_stored_session(self, srv, monkeypatch):
@@ -171,7 +171,7 @@ class TestClearWebSessionRemovesProfile:
         _make_profile(tmp_path)
         store["work"] = {"li_at": "L", "jsessionid": "J"}
         deleted = []
-        monkeypatch.setattr(server, "delete_web_session", lambda alias: deleted.append(alias) or True)
+        monkeypatch.setattr(server, "delete_web_session", lambda alias, **kw: deleted.append(alias) or True)
         monkeypatch.setattr(server.shutil, "rmtree", MagicMock(side_effect=OSError("busy")))
         out = server.clear_web_session()
         assert "busy" in out
@@ -179,7 +179,14 @@ class TestClearWebSessionRemovesProfile:
 
     def test_reports_failure_when_keychain_entry_survives(self, srv, monkeypatch):
         server, store, tmp_path = srv
-        store["work"] = {"li_at": "L", "jsessionid": "J"}
-        monkeypatch.setattr(server, "delete_web_session", lambda alias: True)  # lies: file gone, keychain not
+        _make_profile(tmp_path)
+        calls = []
+
+        def strict_delete(alias, **kw):
+            calls.append(kw)
+            raise RuntimeError("keychain refused to delete the web session for 'work': locked")
+
+        monkeypatch.setattr(server, "delete_web_session", strict_delete)
         out = server.clear_web_session()
-        assert out.startswith("❌") and "keychain" in out
+        assert out.startswith("❌") and "keychain" in out and "locked" in out
+        assert calls == [{"strict": True}]

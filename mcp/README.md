@@ -22,7 +22,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server that lets Cla
 | `logout` | Delete the saved OAuth token |
 | `check_auth` | Token status, granted scopes, and active capability **tier** |
 | `set_web_session` | Manually store `li_at` + `JSESSIONID` cookies (if not captured automatically) |
-| `clear_web_session` | Remove saved browser session cookies |
+| `clear_web_session` | Delete the stored session cookies **and** the logged-in browser profile — switches Voyager off until the next `authenticate` |
 
 ### Profile
 | Tool | What it does |

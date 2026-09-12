@@ -51,7 +51,8 @@ jobs:
             .claude-plugin/ \
             .mcp.json \
             .env.example \
-            README.md
+            README.md \
+            SECURITY.md
 
       - name: Generate SHA256 checksum
         run: sha256sum linkedin-mcp.plugin > linkedin-mcp.plugin.sha256

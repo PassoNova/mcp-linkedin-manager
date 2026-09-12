@@ -67,9 +67,10 @@ fi
 
 # ── Validate install directory ─────────────────────────────────────────────────
 # `rm -rf "$INSTALL_DIR"` below is only ever run against a directory that is
-# new, empty, or carries the $MARKER file this script writes after extraction.
-# Nothing else is accepted as evidence of a previous install: installs that
-# predate the marker must be removed by hand once (the error says how).
+# new, empty, or a previous install made by this script: it must carry the
+# $MARKER file this script writes after extraction (whose content must be a
+# release tag) AND the server entry point mcp/server.py. Nothing else is
+# accepted; installs that predate the marker must be removed by hand once.
 
 MARKER=".linkedin-mcp-install"
 INSTALL_DIR="${INSTALL_DIR%/}"
@@ -98,11 +99,13 @@ if [ -d "$INSTALL_DIR" ]; then
         if [ -e "$INSTALL_DIR/.git" ]; then
             err "'$INSTALL_DIR' is a git checkout. Refusing to delete it — install into a dedicated directory instead."
         fi
-        if [ ! -f "$INSTALL_DIR/$MARKER" ]; then
-            if [ -f "$INSTALL_DIR/mcp/server.py" ]; then
-                err "'$INSTALL_DIR' looks like a linkedin-mcp install made before installs were marked. Refusing to delete it automatically — check its contents, then remove it yourself (rm -rf '$INSTALL_DIR') and re-run."
-            fi
-            err "'$INSTALL_DIR' is not empty and is not a previous linkedin-mcp install (no $MARKER). Refusing to delete it — choose another directory or clear it yourself."
+        if [ -f "$INSTALL_DIR/$MARKER" ] && [ -f "$INSTALL_DIR/mcp/server.py" ] \
+           && grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+' "$INSTALL_DIR/$MARKER"; then
+            info "Found previous linkedin-mcp install ($(head -1 "$INSTALL_DIR/$MARKER")) — it will be replaced."
+        elif [ -f "$INSTALL_DIR/mcp/server.py" ]; then
+            err "'$INSTALL_DIR' looks like a linkedin-mcp install made before installs were marked. Refusing to delete it automatically — check its contents, then remove it yourself (rm -rf '$INSTALL_DIR') and re-run."
+        else
+            err "'$INSTALL_DIR' is not empty and is not a previous linkedin-mcp install. Refusing to delete it — choose another directory or clear it yourself."
         fi
     fi
 fi

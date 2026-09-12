@@ -456,8 +456,15 @@ def exchange_code(
 
 
 def has_browser_profile(path: str = DEFAULT_BROWSER_DIR) -> bool:
-    """Return True if a persistent Playwright browser profile has been created."""
-    return os.path.exists(path) and bool(os.listdir(path))
+    """Return True if a persistent Playwright browser profile has been created.
+
+    This is the first thing every profile-opening path checks, so an existing
+    directory is tightened to 0700 here — before it is listed or launched.
+    """
+    if not os.path.isdir(path):
+        return False
+    ensure_private_dir(path)
+    return bool(os.listdir(path))
 
 
 def _capture_chrome_linkedin_cookies() -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -1093,16 +1100,36 @@ def load_web_session(alias: str) -> Optional[dict]:
         return json.load(fh)
 
 
-def delete_web_session(alias: str) -> bool:
-    """Remove saved web session for alias from keychain and/or file. Returns True if deleted."""
+def delete_web_session(alias: str, *, strict: bool = False) -> bool:
+    """Remove saved web session for alias from keychain and/or file. Returns True if deleted.
+
+    With ``strict=True`` a keychain failure is not swallowed: the entry must
+    either be deleted or confirmed absent by a read, otherwise ``RuntimeError``
+    is raised. ``clear_web_session`` uses this so it never reports success
+    while a live ``li_at`` still sits in the keychain.
+    """
     key = f"{_KR_KEY}:{alias}"
     deleted = False
     if _HAS_KEYRING:
         try:
             keyring.delete_password(_KR_SERVICE, key)
             deleted = True
-        except Exception:
-            pass
+        except Exception as exc:
+            if strict:
+                # keyring raises for a missing entry too — accept only if a
+                # read confirms it is really gone.
+                try:
+                    still_there = keyring.get_password(_KR_SERVICE, key) is not None
+                except Exception as read_exc:
+                    raise RuntimeError(
+                        f"keychain unavailable while clearing the web session for '{alias}': {read_exc}"
+                    ) from read_exc
+                if still_there:
+                    raise RuntimeError(
+                        f"keychain refused to delete the web session for '{alias}': {exc}"
+                    ) from exc
+            else:
+                _log.debug("Keychain delete for '%s' failed: %s", alias, exc)
     path = _session_path(alias)
     if os.path.exists(path):
         os.remove(path)

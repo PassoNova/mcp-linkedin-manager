@@ -450,3 +450,42 @@ class TestDeleteCredentials:
 
         result = auth.delete_credentials()
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# delete_web_session(strict=True)
+# ---------------------------------------------------------------------------
+
+class TestDeleteWebSessionStrict:
+    def _kr(self, monkeypatch, tmp_path, *, delete_error, read):
+        import auth
+        monkeypatch.setattr(auth, "_HAS_KEYRING", True)
+        mock_kr = MagicMock()
+        mock_kr.delete_password.side_effect = delete_error
+        if isinstance(read, Exception):
+            mock_kr.get_password.side_effect = read
+        else:
+            mock_kr.get_password.return_value = read
+        monkeypatch.setattr(auth, "keyring", mock_kr)
+        monkeypatch.setattr(auth, "_session_path", lambda alias: str(tmp_path / f"no_{alias}.json"))
+        return auth
+
+    def test_delete_error_with_surviving_entry_raises(self, tmp_path, monkeypatch):
+        import pytest
+        auth = self._kr(monkeypatch, tmp_path, delete_error=RuntimeError("locked"), read='{"li_at": "L"}')
+        with pytest.raises(RuntimeError, match="refused to delete"):
+            auth.delete_web_session("work", strict=True)
+
+    def test_delete_error_with_unreadable_keychain_raises(self, tmp_path, monkeypatch):
+        import pytest
+        auth = self._kr(monkeypatch, tmp_path, delete_error=RuntimeError("locked"), read=RuntimeError("no backend"))
+        with pytest.raises(RuntimeError, match="unavailable"):
+            auth.delete_web_session("work", strict=True)
+
+    def test_delete_error_for_absent_entry_is_not_an_error(self, tmp_path, monkeypatch):
+        auth = self._kr(monkeypatch, tmp_path, delete_error=RuntimeError("no such entry"), read=None)
+        assert auth.delete_web_session("work", strict=True) is False
+
+    def test_non_strict_still_swallows(self, tmp_path, monkeypatch):
+        auth = self._kr(monkeypatch, tmp_path, delete_error=RuntimeError("locked"), read='{"li_at": "L"}')
+        assert auth.delete_web_session("work") is False
