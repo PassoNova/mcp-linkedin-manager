@@ -82,3 +82,34 @@ linkedin-mcp install.
 `cryptography`, `starlette`, `pydantic-settings` and `python-multipart` to
 versions past their known advisories; `uvx pip-audit` against the exported
 lock is part of the release checklist.
+
+## Known residual risks
+
+Accepted for now; each is bounded and documented so nobody has to rediscover it.
+
+- **Profile lifecycle during a long login.** `authenticate` owns the per-alias
+  Playwright profile for as long as the login window is open (minutes), and it
+  cannot hold the alias lock for that time. A `clear_web_session` / `logout`
+  issued meanwhile is honoured — the in-flight login persists nothing, the
+  profile it wrote is removed when the flow ends, and recovery from that
+  profile is refused until a session is stored again on purpose — but until
+  the flow ends the on-disk profile can hold a live session, and Chromium can
+  re-create the directory. Likewise a Voyager request already executing when a
+  clear runs may fail rather than be waited for: there is no per-request lease
+  on the profile. The security outcome (Voyager stays off after a clear) holds;
+  the availability outcome (that request succeeding) does not.
+- **Fallback-file permissions are fixed lazily.** The `0600` / `0700` modes are
+  re-applied whenever the server loads, saves, or opens a file or profile, not
+  by a background sweep: a file the server has not touched since an upgrade
+  keeps its old mode until the next call. On a filesystem that rejects `chmod`
+  the server refuses the file (fail closed) rather than using it; fix the
+  mode by hand or delete the file. All of this is POSIX-only (see above for
+  Windows).
+- **Expired cookies are sent once.** A captured `li_at` that LinkedIn has since
+  expired is not pre-validated; the first Voyager call sends it and is
+  rejected, after which the tool reports the missing session.
+- **`refresh_web_session` trusts the profile.** It is an explicit user action
+  and harvests whatever session the profile contains, even after a clear.
+- **Pre-marker installs.** `scripts/install.sh` will not delete an install
+  made before the `.linkedin-mcp-install` marker existed; remove it by hand
+  once, as the error message says.
