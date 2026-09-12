@@ -61,6 +61,7 @@ from auth import (
     delete_web_session,
     get_active_alias,
     harvest_session_from_profile,
+    ensure_private_dir,
     has_browser_profile,
     is_token_expired,
     load_credentials,
@@ -80,11 +81,39 @@ from client import LinkedInClient, VoyagerClient
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────
 
-# Explicit path: python-dotenv would otherwise search upward and could still pick
-# up a legacy repository-root .env that the docs say is no longer read.
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-
 _log = logging.getLogger("linkedin_mcp.server")
+
+
+def _load_env_files() -> Optional[str]:
+    """Load ``mcp/.env``; fall back to a legacy repository-root ``.env`` only if it is absent.
+
+    The generic ``load_dotenv()`` searched upward from this file, so installs
+    that predate the ``mcp/.env`` convention kept their app credentials in the
+    repository root and still worked. That exact behaviour is preserved (the
+    root file is read only when ``mcp/.env`` does not exist) so an upgrade
+    does not silently drop the official OAuth path; the fallback is logged as
+    deprecated so the user migrates it to the keychain. Returns the path that
+    was loaded, or None.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    primary = os.path.join(here, ".env")
+    if os.path.isfile(primary):
+        load_dotenv(primary)
+        return primary
+    legacy = os.path.join(os.path.dirname(here), ".env")
+    if os.path.isfile(legacy):
+        load_dotenv(legacy)
+        _log.warning(
+            "Loaded credentials from the legacy repository-root .env (%s). This fallback is "
+            "deprecated: store them in the keychain with `python -m linkedin_mcp setup` "
+            "(run from mcp/ with `uv run`) and delete the file, or move it to mcp/.env.",
+            legacy,
+        )
+        return legacy
+    return None
+
+
+_load_env_files()
 
 
 def _git_version() -> str:
@@ -287,11 +316,28 @@ def _recover_session_from_profile_unlocked(alias: str) -> Optional[dict]:
     return load_web_session(alias)
 
 
-def _get_voyager_client(alias: Optional[str] = None) -> Optional[VoyagerClient]:
-    """Return a reusable VoyagerClient for alias, creating one only when session changes."""
+def _get_voyager_client(alias: Optional[str] = None, *, optional: bool = False) -> Optional[VoyagerClient]:
+    """Return a reusable VoyagerClient for alias, creating one only when session changes.
+
+    With ``optional=True`` (tools that only *enrich* an official-API answer:
+    ``get_profile``, ``update_headline``) an unusable session file or browser
+    profile — symlinked, wrong owner, mode that cannot be tightened — is
+    reported as "Voyager unavailable" (``None``) instead of raised, so the
+    documented OAuth fallback still runs. The unsafe file or profile is still
+    refused (never opened, never deleted). Tools that *require* Voyager keep
+    the exception so the user sees what to fix.
+    """
     alias = alias or _active_alias()
     with _alias_lock(alias):
-        return _get_voyager_client_unlocked(alias)
+        if not optional:
+            return _get_voyager_client_unlocked(alias)
+        try:
+            return _get_voyager_client_unlocked(alias)
+        except (OSError, RuntimeError) as exc:
+            _log.warning(
+                "Voyager unavailable for '%s' (%s); using the official API only", alias, exc
+            )
+            return None
 
 
 def _get_voyager_client_unlocked(alias: Optional[str] = None) -> Optional[VoyagerClient]:
@@ -670,7 +716,7 @@ def get_profile() -> str:
             vanity = ""
             source = "oauth"
 
-            voyager = _get_voyager_client()
+            voyager = _get_voyager_client(optional=True)
             if voyager:
                 try:
                     vme = voyager.get_me()
@@ -737,7 +783,7 @@ def update_headline(
         return f"❌ Headline is {len(headline)} characters. LinkedIn allows a maximum of 220."
 
     with _tool_log("update_headline", chars=len(headline)):
-        voyager = _get_voyager_client()
+        voyager = _get_voyager_client(optional=True)
         if voyager:
             try:
                 vme = voyager.get_me()
@@ -803,13 +849,26 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
                 # generation under one lock, so an overlapping clear/logout is observed.
                 _invalidate_voyager_unlocked(active)
                 generation = _session_generation.get(active, 0)
-            udd = bdir if has_browser_profile(bdir) else None
-            _log.debug("set_web_session: validating session for '%s' (browser_dir=%s)", active, udd)
-            vc = VoyagerClient(li_at, jsessionid, user_data_dir=udd)
+            # The Voyager client only runs on a persistent profile (that is where the
+            # fingerprint/cookie pairing lives), so after clear_web_session removed the
+            # only profile a fresh one is created here and seeded with the supplied
+            # cookies by VoyagerClient itself (it injects them when the profile holds
+            # no session of its own). If validation fails, a profile that did not
+            # exist before is removed again so nothing half-initialised is left behind.
+            seeded = not has_browser_profile(bdir)
+            if seeded:
+                ensure_private_dir(bdir)
+            _log.debug("set_web_session: validating session for '%s' (browser_dir=%s, new=%s)", active, bdir, seeded)
+            vc = VoyagerClient(li_at, jsessionid, user_data_dir=bdir)
             try:
                 me = vc.get_me()
-            finally:
+            except Exception:
                 vc.close()
+                if seeded:
+                    with _alias_lock(active):
+                        _remove_browser_profile(active)
+                raise
+            vc.close()
             name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
             headline = me.get("headline", "")
             with _alias_lock(active):
@@ -833,9 +892,10 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
         except Exception as exc:
             _log.error("set_web_session failed: %s", exc)
             return (
-                f"❌ Session validation failed — browser profile may not have a valid LinkedIn session.\n"
+                f"❌ Session validation failed — LinkedIn did not accept the supplied cookies.\n"
                 f"   {_format_error(exc)}\n\n"
-                "Run `authenticate` first to set up the browser profile, then try again."
+                "Copy fresh li_at / JSESSIONID values from a logged-in browser and try again, "
+                "or run `authenticate` to log in inside the Playwright window instead."
             )
 
 

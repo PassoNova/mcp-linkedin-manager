@@ -62,7 +62,8 @@ require claude
 if [ -n "${LINKEDIN_CLIENT_ID:-}" ] || [ -n "${LINKEDIN_CLIENT_SECRET:-}" ]; then
     warn "LINKEDIN_CLIENT_ID / LINKEDIN_CLIENT_SECRET in the environment are ignored:"
     warn "the installer no longer writes credentials into Claude's config."
-    warn "Run 'python -m linkedin_mcp setup' after installing to store them in the OS keychain."
+    warn "After installing, store them in the OS keychain with:"
+    warn "    cd \"$INSTALL_DIR/mcp\" && uv run python -m linkedin_mcp setup"
 fi
 
 # ── Validate install directory ─────────────────────────────────────────────────

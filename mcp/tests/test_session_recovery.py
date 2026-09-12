@@ -335,3 +335,118 @@ class TestRecoveryRefusedAfterClear:
         server._invalidate_voyager(None)
         assert server._voyager_singletons == {}
         a.close.assert_called_once(); b.close.assert_called_once()
+
+
+class TestSetWebSessionSeedsProfile:
+    """After clear_web_session removed the only profile, set_web_session must still be able
+    to validate the supplied cookies: it creates a fresh private profile that VoyagerClient
+    seeds with them, and removes that profile again if validation fails."""
+
+    def test_creates_profile_when_none_exists_and_keeps_it_on_success(self, srv):
+        server, store, tmp_path = srv
+        profile = tmp_path / "profile_work"
+        assert not profile.exists()
+        server.VoyagerClient.return_value.get_me.return_value = {"first_name": "A", "last_name": "B", "headline": "h"}
+        out = server.set_web_session("li", "js")
+        assert out.startswith("✅") and store["work"]["li_at"] == "li"
+        args, kwargs = server.VoyagerClient.call_args
+        assert kwargs["user_data_dir"] == str(profile)  # never None: the client refuses that
+        assert profile.is_dir()
+        if os.name == "posix":
+            assert (profile.stat().st_mode & 0o777) == 0o700
+
+    def test_removes_seeded_profile_when_validation_fails(self, srv):
+        server, store, tmp_path = srv
+        profile = tmp_path / "profile_work"
+        server.VoyagerClient.return_value.get_me.side_effect = RuntimeError("401 from LinkedIn")
+        out = server.set_web_session("li", "js")
+        assert out.startswith("❌") and "did not accept" in out
+        assert "work" not in store
+        assert not profile.exists()
+        server.VoyagerClient.return_value.close.assert_called()
+
+    def test_keeps_pre_existing_profile_when_validation_fails(self, srv):
+        server, store, tmp_path = srv
+        _make_profile(tmp_path)
+        profile = tmp_path / "profile_work"
+        server.VoyagerClient.return_value.get_me.side_effect = RuntimeError("401 from LinkedIn")
+        out = server.set_web_session("li", "js")
+        assert out.startswith("❌")
+        assert profile.is_dir() and any(profile.iterdir())  # not ours to remove
+
+    def test_refuses_symlinked_profile_path(self, srv, tmp_path):
+        server, store, _ = srv
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        link = tmp_path / "profile_work"
+        link.symlink_to(target)
+        out = server.set_web_session("li", "js")
+        assert out.startswith("❌") and "symlink" in out
+        assert "work" not in store
+        assert link.is_symlink() and target.is_dir()  # refused, never opened, never deleted
+
+
+class TestOptionalVoyagerDiscovery:
+    """An unsafe session file or profile must not break the official-API path of the
+    tools that only *enrich* with Voyager; the tools that require Voyager still see it."""
+
+    def test_optional_path_reports_unavailable_on_unsafe_session_file(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+
+        def unsafe(alias):
+            raise OSError("refusing to use web_session_work.json: it is a symlink")
+
+        monkeypatch.setattr(server, "load_web_session", unsafe)
+        assert server._get_voyager_client(optional=True) is None
+        with pytest.raises(OSError):
+            server._get_voyager_client()
+
+    def test_optional_path_reports_unavailable_on_unsafe_profile(self, srv, monkeypatch, tmp_path):
+        server, store, _ = srv
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (tmp_path / "profile_work").symlink_to(target)  # has_browser_profile -> ensure_private_dir raises
+        assert server._get_voyager_client(optional=True) is None
+        with pytest.raises(OSError):
+            server._get_voyager_client()
+
+    def test_get_profile_falls_back_to_oauth_on_unsafe_session_file(self, srv, monkeypatch):
+        server, store, tmp_path = srv
+        monkeypatch.setattr(server, "load_web_session", lambda alias: (_ for _ in ()).throw(OSError("unsafe")))
+        client = MagicMock()
+        client.get_userinfo.return_value = {"sub": "u1", "name": "A B", "email": "a@b"}
+        client.get_profile.return_value = {"headline": "official", "vanityName": "ab"}
+        monkeypatch.setattr(server, "_get_client", lambda: client)
+        out = server.get_profile()
+        assert "official" in out and not out.startswith("❌")
+        server.VoyagerClient.assert_not_called()
+
+
+class TestEnvFileLoading:
+    def _layout(self, tmp_path, monkeypatch):
+        mcp_dir = tmp_path / "mcp"
+        mcp_dir.mkdir()
+        import server
+        monkeypatch.setattr(server, "__file__", str(mcp_dir / "server.py"))
+        monkeypatch.delenv("LINKEDIN_MCP_ENV_PROBE", raising=False)
+        return server, mcp_dir, tmp_path / ".env"
+
+    def test_primary_mcp_env_wins(self, tmp_path, monkeypatch):
+        server, mcp_dir, legacy = self._layout(tmp_path, monkeypatch)
+        (mcp_dir / ".env").write_text("LINKEDIN_MCP_ENV_PROBE=primary\n")
+        legacy.write_text("LINKEDIN_MCP_ENV_PROBE=legacy\n")
+        assert server._load_env_files() == str(mcp_dir / ".env")
+        assert os.environ["LINKEDIN_MCP_ENV_PROBE"] == "primary"
+
+    def test_legacy_root_env_is_read_when_primary_is_absent(self, tmp_path, monkeypatch, caplog):
+        server, mcp_dir, legacy = self._layout(tmp_path, monkeypatch)
+        legacy.write_text("LINKEDIN_MCP_ENV_PROBE=legacy\n")
+        with caplog.at_level("WARNING", logger="linkedin_mcp.server"):
+            assert server._load_env_files() == str(legacy)
+        assert os.environ["LINKEDIN_MCP_ENV_PROBE"] == "legacy"
+        assert any("deprecated" in r.getMessage() for r in caplog.records)
+
+    def test_nothing_to_load(self, tmp_path, monkeypatch):
+        server, mcp_dir, legacy = self._layout(tmp_path, monkeypatch)
+        assert server._load_env_files() is None
+        assert "LINKEDIN_MCP_ENV_PROBE" not in os.environ

@@ -103,8 +103,10 @@ Accepted for now; each is bounded and documented so nobody has to rediscover it.
   by a background sweep: a file the server has not touched since an upgrade
   keeps its old mode until the next call. On a filesystem that rejects `chmod`
   the server refuses the file (fail closed) rather than using it; fix the
-  mode by hand or delete the file. All of this is POSIX-only (see above for
-  Windows).
+  mode by hand or delete the file. Tools that only *enrich* an official-API
+  answer with Voyager (`get_profile`, `update_headline`) then log the refusal
+  and fall back to the official API; tools that require Voyager report it.
+  All of this is POSIX-only (see above for Windows).
 - **Expired cookies are sent once.** A captured `li_at` that LinkedIn has since
   expired is not pre-validated; the first Voyager call sends it and is
   rejected, after which the tool reports the missing session.
