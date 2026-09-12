@@ -117,3 +117,19 @@ Accepted for now; each is bounded and documented so nobody has to rediscover it.
   parses `ls -A`; a directory whose only entries are names made solely of
   newline characters reads as empty and would be replaced. Such names do not
   occur in practice and the marker/git/`$HOME`/`/` guards still apply.
+
+- **Profile ownership across overlapping logins.** A stale `authenticate` that observes a
+  lifecycle-generation bump removes the alias's profile; if a newer `authenticate` for the
+  same alias started in between, that cleanup can remove the newer login's profile and the
+  user simply re-runs `authenticate`. Flows are not leased per directory. Impact: one extra
+  login on a single-user, local tool. Accepted.
+- **Clear tombstone is process-local.** `_cleared_pending` does not survive a server
+  restart, so a login that recreated the profile after a clear can be harvested by the next
+  `_get_voyager_client` once the process restarts. Run `clear_web_session` (or `logout`)
+  again after a restart if a clear raced a login. Accepted; a persisted tombstone is tracked
+  as future work.
+- **Installer replace is not atomic.** `scripts/install.sh` validates the target directory
+  and then removes it by path; a parent directory or mount swapped between the two steps by
+  another local process could redirect the removal. The installer already refuses `/`,
+  `$HOME`, git checkouts and unmarked non-empty directories; it does not defend against a
+  hostile local user with write access to the parent. Accepted for a user-run installer.

@@ -43,7 +43,7 @@ Manager / Linux Secret Service). No `.env` file is created or needed.
 If the OS keychain is unavailable, fall back to a `.env` file:
 
 ```bash
-cp .env.example .env
+cp ../.env.example .env
 chmod 600 .env
 # Edit .env with LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET
 ```

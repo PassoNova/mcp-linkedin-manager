@@ -82,7 +82,10 @@ marker_is_ours() {
     local content rest
     # Read the whole file, not just the first line, so trailing bytes or extra
     # lines cannot hide behind a valid first line.
-    content=$(cat "$1"; printf x); content="${content%x}"
+    content=$(cat "$1" 2>/dev/null; printf x); content="${content%x}"  # NUL bytes are dropped here and caught by the byte-count check below
+    # Command substitution drops NUL bytes, so also require the on-disk byte count
+    # to equal the captured length; any NUL would make the file longer than seen.
+    [ "$(wc -c < "$1" | tr -d ' ')" -eq "${#content}" ] || return 1
     [ "${content%$'\n'}" != "$content" ] || return 1          # must end with exactly one newline
     content="${content%$'\n'}"
     case "$content" in *$'\n'*) return 1;; esac                # and contain no other newline
