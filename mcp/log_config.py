@@ -45,6 +45,12 @@ def setup() -> None:
         encoding="utf-8",
     )
     fh.setFormatter(_FORMATTER)
+    # The log can contain aliases, profile paths and API error bodies — keep it
+    # owner-only. RotatingFileHandler opens the file on creation, so it exists here.
+    try:
+        os.chmod(LOG_FILE, 0o600)
+    except OSError:
+        pass  # e.g. a log file owned by another user; logging still works
     root.addHandler(fh)
 
     # Console handler only when LINKEDIN_MCP_DEBUG=1

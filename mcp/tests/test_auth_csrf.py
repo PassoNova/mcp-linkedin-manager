@@ -53,6 +53,12 @@ class TestCallbackHandlerCSRF:
         assert "mismatch" in h.server.error.lower()
         h.send_response.assert_called_once_with(400)
 
+    def test_mismatch_error_does_not_echo_expected_state(self):
+        h = _make_handler("/callback?code=mycode&state=WRONG", "secret-expected-state")
+        h.do_GET()
+        assert "secret-expected-state" not in h.server.error
+        assert "WRONG" not in h.server.error
+
     def test_missing_state_treated_as_mismatch(self):
         h = _make_handler("/callback?code=mycode", "abc123")
         h.do_GET()

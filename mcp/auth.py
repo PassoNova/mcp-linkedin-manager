@@ -112,6 +112,32 @@ def _browser_dir(alias: str) -> str:
     return os.path.expanduser(f"~/.linkedin_mcp_browser_{alias}")
 
 
+def _ensure_private_dir(path: str) -> None:
+    """Create ``path`` (if needed) and force owner-only permissions (0700).
+
+    The Playwright profile holds the live LinkedIn session cookie, so it must
+    never be group- or world-readable. ``os.makedirs(mode=...)`` is masked by
+    the umask, and pre-existing directories are left untouched by it, so an
+    explicit ``chmod`` follows in both cases.
+    """
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def _write_private_json(path: str, data: dict) -> None:
+    """Write ``data`` as JSON to ``path`` with mode 0600 from the moment it exists.
+
+    Opening with ``os.open(..., 0o600)`` avoids the window where a file created
+    by ``open(path, "w")`` is readable under the default umask before a later
+    ``chmod``. An existing file keeps its inode, so its mode is re-applied too.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(data, fh, indent=2)
+    os.chmod(path, 0o600)
+
+
 # ── OAuth callback pages ───────────────────────────────────────────────────────
 
 _SUCCESS_PAGE = """<!DOCTYPE html>
@@ -326,11 +352,10 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         received_state = params.get("state", [None])[0]
 
         if "code" in params:
-            if srv.expected_state and received_state != srv.expected_state:
-                srv.error = (
-                    f"State mismatch in OAuth callback — possible CSRF attempt. "
-                    f"Expected {srv.expected_state!r}, got {received_state!r}."
-                )
+            if srv.expected_state and not secrets.compare_digest(
+                (received_state or "").encode(), srv.expected_state.encode()
+            ):
+                srv.error = "State mismatch in OAuth callback — possible CSRF attempt."
                 body = _ERROR_PAGE.encode()
                 self.send_response(400)
             else:
@@ -618,6 +643,7 @@ def harvest_session_from_profile(
     if not has_browser_profile(browser_dir):
         return None, None, "no browser profile — run `authenticate` first"
     try:
+        _ensure_private_dir(browser_dir)
         with _sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 browser_dir, headless=True, args=_LAUNCH_ARGS
@@ -651,7 +677,7 @@ def _init_headless_profile(
     """
     try:
         _log.debug("Initializing Playwright headless profile at %s", browser_dir)
-        os.makedirs(browser_dir, exist_ok=True)
+        _ensure_private_dir(browser_dir)
         with _sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 browser_dir, headless=True, args=_LAUNCH_ARGS
@@ -751,7 +777,7 @@ def _run_oauth_flow_playwright(
     redirect_uri = f"http://localhost:{port}/callback"
     state = secrets.token_urlsafe(16)
     auth_url = build_auth_url(client_id, redirect_uri, state)
-    os.makedirs(browser_dir, exist_ok=True)
+    _ensure_private_dir(browser_dir)
 
     callback = _CallbackServer(port, state)
     callback.start()
@@ -969,10 +995,7 @@ def save_token(token_data: dict, alias: str) -> None:
         except Exception as exc:
             _log.debug("Keychain save failed, using file: %s", exc)
     path = _token_path(alias)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w") as fh:
-        json.dump(token_data, fh, indent=2)
-    os.chmod(path, 0o600)
+    _write_private_json(path, token_data)
     _log.debug("Token for '%s' saved to %s", alias, path)
 
 
@@ -1037,10 +1060,7 @@ def save_web_session(li_at: str, jsessionid: str, alias: str) -> None:
         except Exception as exc:
             _log.debug("Keychain session save failed, using file: %s", exc)
     path = _session_path(alias)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w") as fh:
-        json.dump(data, fh, indent=2)
-    os.chmod(path, 0o600)
+    _write_private_json(path, data)
     _log.debug("Web session for '%s' saved to %s", alias, path)
 
 
