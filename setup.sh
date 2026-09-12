@@ -73,7 +73,12 @@ if [ -f "$ENV_FILE" ] && grep -qE '^LINKEDIN_CLIENT_SECRET=.+' "$ENV_FILE"; then
 fi
 if [ -t 0 ]; then
     echo "▶ Storing LinkedIn app credentials in the OS keychain..."
-    uv run python -m linkedin_mcp setup
+    if ! uv run python -m linkedin_mcp setup; then
+        echo "⚠️  Could not store the credentials in an OS keychain (no usable backend, or"
+        echo "   the wizard was cancelled). The server is registered; use the fallback:"
+        echo "   export LINKEDIN_CLIENT_ID / LINKEDIN_CLIENT_SECRET in the environment that"
+        echo "   launches Claude, or keep a 'chmod 600' .env next to mcp/server.py."
+    fi
 else
     echo "⚠️  Non-interactive shell — skipping credential setup. Run this later:"
     echo "     cd $MCP_DIR && uv run python -m linkedin_mcp setup"

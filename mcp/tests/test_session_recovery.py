@@ -271,3 +271,40 @@ class TestLifecycleGeneration:
         server.VoyagerClient.return_value.get_me.return_value = {"first_name": "A", "last_name": "B", "headline": "h"}
         out = server.set_web_session("li", "js")
         assert out.startswith("✅") and store["work"]["li_at"] == "li"
+
+    def test_authenticate_persists_nothing_when_logged_out_mid_flight(self, srv, monkeypatch):
+        import asyncio
+        import auth
+        server, store, tmp_path = srv
+        writes = []
+        monkeypatch.setattr(server, "_credentials", lambda: ("cid", "csec"))
+        monkeypatch.setattr(server, "save_token", lambda data, alias: writes.append(("token", alias)))
+        monkeypatch.setattr(server, "register_alias", lambda alias: writes.append(("register", alias)))
+
+        async def fake_flow(*a, **kw):
+            _make_profile(tmp_path)  # the flow writes into the profile...
+            server._bump_generation("work")  # ...and logout/clear lands before it returns
+            return auth.OAuthResult({"access_token": "t", "expires_in": 1}, "L", "J", None, "playwright")
+
+        monkeypatch.setattr(server, "run_oauth_flow", fake_flow)
+        out = asyncio.run(server.authenticate("work"))
+        assert out.startswith("❌") and "discarded" in out
+        assert writes == [] and "work" not in store
+        assert not (tmp_path / "profile_work").exists()
+
+    def test_authenticate_persists_when_not_interrupted(self, srv, monkeypatch):
+        import asyncio
+        import auth
+        server, store, tmp_path = srv
+        writes = []
+        monkeypatch.setattr(server, "_credentials", lambda: ("cid", "csec"))
+        monkeypatch.setattr(server, "save_token", lambda data, alias: writes.append(("token", alias)))
+        monkeypatch.setattr(server, "register_alias", lambda alias: writes.append(("register", alias)))
+
+        async def fake_flow(*a, **kw):
+            return auth.OAuthResult({"access_token": "t", "expires_in": 1}, "L", "J", None, "playwright")
+
+        monkeypatch.setattr(server, "run_oauth_flow", fake_flow)
+        out = asyncio.run(server.authenticate("work"))
+        assert out.startswith("✅") or "Voyager" in out
+        assert writes == [("token", "work"), ("register", "work")] and store["work"]["li_at"] == "L"

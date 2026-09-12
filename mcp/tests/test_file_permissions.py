@@ -313,3 +313,13 @@ class TestLogFile:
         with pytest.raises(OSError, match="symlink"):
             log_config._PrivateRotatingFileHandler(str(link), maxBytes=0, backupCount=0, encoding="utf-8")
         assert real.read_text() == "keep\n"
+
+    def test_symlinked_log_backup_is_refused(self, tmp_path):
+        import log_config
+        real = tmp_path / "victim"
+        real.write_text("x")
+        os.chmod(real, 0o644)
+        (tmp_path / "s.log.1").symlink_to(real)
+        with pytest.raises(OSError, match="symlink"):
+            log_config._PrivateRotatingFileHandler(str(tmp_path / "s.log"), maxBytes=0, backupCount=2, encoding="utf-8")
+        assert _mode(real) == 0o644

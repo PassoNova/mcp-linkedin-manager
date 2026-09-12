@@ -1087,6 +1087,10 @@ def _delete_secret(kind: str, key: str, path: str, alias: str, strict: bool) -> 
     entry is absent, so callers can only report success when nothing is left.
     """
     deleted = False
+    if os.path.islink(path):
+        # Removing the link would leave the secret at its target while we
+        # report success; refuse, consistent with the read/write paths.
+        raise OSError(f"refusing to delete {path}: it is a symlink")
     if os.path.exists(path):
         os.remove(path)
         deleted = True

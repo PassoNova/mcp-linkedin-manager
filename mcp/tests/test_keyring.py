@@ -522,3 +522,15 @@ class TestDeleteTokenStrict:
         monkeypatch.setattr(auth, "keyring", mock_kr)
         monkeypatch.setattr(auth, "_token_path", lambda alias: str(tmp_path / "none.json"))
         assert auth.delete_token("work") is False
+
+    def test_symlinked_fallback_file_is_refused(self, tmp_path, monkeypatch):
+        import auth, pytest
+        monkeypatch.setattr(auth, "_HAS_KEYRING", False)
+        real = tmp_path / "real.json"
+        real.write_text("{}")
+        link = tmp_path / "tok.json"
+        link.symlink_to(real)
+        monkeypatch.setattr(auth, "_token_path", lambda alias: str(link))
+        with pytest.raises(OSError, match="symlink"):
+            auth.delete_token("work", strict=True)
+        assert real.exists() and link.is_symlink()

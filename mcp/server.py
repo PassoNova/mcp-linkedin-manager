@@ -362,8 +362,19 @@ async def authenticate(alias: str) -> str:
             result = await run_oauth_flow(
                 client_id, client_secret, port=DEFAULT_PORT, browser_dir=_browser_dir(alias)
             )
-            save_token(result.token_data, alias)
-            register_alias(alias)
+            with _voyager_lock:
+                if _lifecycle_generation(alias) != generation:
+                    # clear_web_session / logout ran while the window was open: persist
+                    # nothing (token, registry, cookies) and drop whatever the flow
+                    # wrote into the profile in the meantime.
+                    _remove_browser_profile(alias)
+                    _log.warning("authenticate('%s') discarded: cleared/logged out mid-flight", alias)
+                    return (
+                        f"❌ Login discarded: '{alias}' was cleared or logged out while the "
+                        "login window was open. Run `authenticate` again."
+                    )
+                save_token(result.token_data, alias)
+                register_alias(alias)
 
             scopes = result.token_data.get("scope", "unknown")
             expires_in = result.token_data.get("expires_in", "unknown")
@@ -700,6 +711,8 @@ def set_web_session(li_at: str, jsessionid: str) -> str:
             name = f"{me.get('first_name', '')} {me.get('last_name', '')}".strip()
             headline = me.get("headline", "")
             if not _save_session_if_current(li_at, jsessionid, active, generation):
+                with _voyager_lock:
+                    _remove_browser_profile(active)  # validation may have re-created it
                 return (
                     f"❌ Not saved: the web session for '{active}' was cleared while it was "
                     "being validated. Run `set_web_session` again if you still want it."

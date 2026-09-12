@@ -72,6 +72,8 @@ class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
         """
         for i in range(1, self.backupCount + 1):
             backup = self.rotation_filename(f"{self.baseFilename}.{i}")
+            if os.path.islink(backup):
+                raise OSError(f"refusing to touch log backup {backup}: it is a symlink")
             if os.path.exists(backup):
                 os.chmod(backup, 0o600)
 
