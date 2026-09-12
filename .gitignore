@@ -31,3 +31,7 @@ linkedin-mcp.plugin
 .idea/
 .vscode/
 *.swp
+
+# Claude Code local settings — machine-specific paths and permission rules
+.claude/settings.local.json
+.claude/*.local.json
