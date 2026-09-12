@@ -78,7 +78,7 @@ No `.env` file is created. You do not need to set any environment variables.
 
 **Alternative (`.env` fallback):** if the OS keychain is unavailable:
 ```bash
-cp .env.example .env
+cp ../.env.example .env   # .env.example is at the repository root
 chmod 600 .env
 # Edit .env with LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET
 ```

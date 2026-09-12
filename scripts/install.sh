@@ -79,10 +79,15 @@ MARKER_PREFIX="linkedin-mcp.plugin installed-by scripts/install.sh"
 # True when the marker file holds exactly "<MARKER_PREFIX> v?X.Y.Z": the prefix is
 # compared literally (no regex interpolation) and only the version is pattern-matched.
 marker_is_ours() {
-    local line rest
-    IFS= read -r line < "$1" || return 1
-    rest="${line#"$MARKER_PREFIX "}"
-    [ "$rest" != "$line" ] || return 1
+    local content rest
+    # Read the whole file, not just the first line, so trailing bytes or extra
+    # lines cannot hide behind a valid first line.
+    content=$(cat "$1"; printf x); content="${content%x}"
+    [ "${content%$'\n'}" != "$content" ] || return 1          # must end with exactly one newline
+    content="${content%$'\n'}"
+    case "$content" in *$'\n'*) return 1;; esac                # and contain no other newline
+    rest="${content#"$MARKER_PREFIX "}"
+    [ "$rest" != "$content" ] || return 1
     printf '%s\n' "$rest" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+$'
 }
 
@@ -126,7 +131,6 @@ if [ -d "$INSTALL_DIR" ]; then
         fi
         if [ -f "$INSTALL_DIR/$MARKER" ] && [ ! -L "$INSTALL_DIR/$MARKER" ] \
            && [ -f "$INSTALL_DIR/mcp/server.py" ] && [ ! -L "$INSTALL_DIR/mcp/server.py" ] \
-           && [ "$(wc -l < "$INSTALL_DIR/$MARKER")" -eq 1 ] \
            && marker_is_ours "$INSTALL_DIR/$MARKER"; then
             info "Found previous linkedin-mcp install ($(awk '{print $NF}' "$INSTALL_DIR/$MARKER")) — it will be replaced."
         elif [ -f "$INSTALL_DIR/mcp/server.py" ]; then
